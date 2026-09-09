@@ -546,6 +546,7 @@ class OptimizationAccessor(OptimizationAbstractMixin):
         committable_big_m: float | None = None,
         meshed_thresholds: Sequence[int] | None = None,
         piecewise_options: list[PiecewiseOptions | dict] | None = None,
+        backend: str | None = None,
         **kwargs: Any,
     ) -> tuple[str, str]:
         """Optimize the pypsa network using linopy.
@@ -618,6 +619,9 @@ class OptimizationAccessor(OptimizationAbstractMixin):
         piecewise_options : list[PiecewiseOptions | dict], optional
             Options to override defaults in piecewise constraint formulation.
             Each operator is interpreted as ``y operator f(x)``.
+        backend : str | None, default None
+            Which library builds and solves the problem, 'linopy' or 'nimopt'.
+            Defaults to module wide option `params.optimize.backend`.
         **kwargs:
             Keyword argument used by `linopy.Model.solve`, such as `solver_name`,
             `problem_fn` or solver options directly passed to the solver.
@@ -642,6 +646,8 @@ class OptimizationAccessor(OptimizationAbstractMixin):
             solver_options = options.params.optimize.solver_options.copy()
         if log_to_console is None:
             log_to_console = options.params.optimize.log_to_console
+        if backend is None:
+            backend = options.params.optimize.backend
 
         include_objective_constant = _resolve_include_objective_constant(
             include_objective_constant
@@ -664,6 +670,7 @@ class OptimizationAccessor(OptimizationAbstractMixin):
             committable_big_m=committable_big_m,
             meshed_thresholds=meshed_thresholds,
             piecewise_options=piecewise_options,
+            backend=backend,
             **model_kwargs,
         )
         if extra_functionality:
@@ -702,6 +709,7 @@ class OptimizationAccessor(OptimizationAbstractMixin):
         committable_big_m: float | None = None,
         meshed_thresholds: Sequence[int] | None = None,
         piecewise_options: list[PiecewiseOptions | dict] | None = None,
+        backend: str | None = None,
         **kwargs: Any,
     ) -> Model:
         """Create a linopy.Model instance from a pypsa network.
@@ -747,6 +755,9 @@ class OptimizationAccessor(OptimizationAbstractMixin):
         piecewise_options : list[PiecewiseOptions | dict], optional
             Options to override defaults in piecewise constraint formulation.
             Each operator is interpreted as ``y operator f(x)``.
+        backend : str | None, default None
+            Which library builds and solves the problem, 'linopy' or 'nimopt'.
+            Defaults to module wide option `params.optimize.backend`.
         **kwargs:
             Keyword arguments used by `linopy.Model()`, such as `solver_dir` or `chunk`.
 
@@ -786,6 +797,27 @@ class OptimizationAccessor(OptimizationAbstractMixin):
             )
             if meshed_thresholds is None:
                 meshed_thresholds = [meshed_threshold]
+
+        if backend is None:
+            backend = options.params.optimize.backend
+        if backend == "nimopt":
+            from pypsa.optimization.nimopt_backend import (  # noqa: PLC0415
+                create_model as _nimopt_model,
+            )
+
+            return _nimopt_model(
+                n,
+                sns,
+                multi_investment_periods=multi_investment_periods,
+                transmission_losses=transmission_losses,
+                linearized_unit_commitment=linearized_unit_commitment,
+                include_objective_constant=include_objective_constant,
+                meshed_thresholds=meshed_thresholds,
+                **kwargs,
+            )
+        if backend != "linopy":
+            msg = f"Unknown optimisation backend {backend!r}; use 'linopy' or 'nimopt'."
+            raise ValueError(msg)
 
         kwargs.setdefault("force_dim_names", True)
         window = SnapshotWindow.build(n, sns, options.optimization.model_snapshot_index)

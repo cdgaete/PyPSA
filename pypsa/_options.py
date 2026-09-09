@@ -471,6 +471,11 @@ options._add_option(
     "Note: not all solvers support this option (e.g. HiGHS does, CPLEX does not).",
 )
 options._add_option(
+    "params.optimize.backend",
+    "linopy",
+    "Which library builds and solves the optimisation problem: 'linopy' or 'nimopt'.",
+)
+options._add_option(
     "params.optimize.include_objective_constant",
     None,
     "Include capital costs of existing capacity on extendable assets in the objective. "

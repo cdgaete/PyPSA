@@ -214,9 +214,92 @@ def ac_dc_periods(ac_dc_network):
 
 
 @pytest.fixture
+def ac_dc_two_periods(ac_dc_network):
+    n = ac_dc_network
+    n.snapshots = pd.MultiIndex.from_product([[2013, 2020], n.snapshots])
+    n.investment_periods = [2013, 2020]
+    return n
+
+
+@pytest.fixture
+def committable_periods():
+    """A committable meeting a load that swings across an investment period's edge."""
+    n = pypsa.Network()
+    n.set_snapshots(pd.RangeIndex(4))
+    n.add("Bus", "b")
+    n.add("Carrier", "gas")
+    n.add(
+        "Generator",
+        "cheap",
+        bus="b",
+        carrier="gas",
+        p_nom=100,
+        marginal_cost=10,
+        committable=True,
+        p_min_pu=0.4,
+        start_up_cost=800,
+        shut_down_cost=300,
+    )
+    n.add("Generator", "peak", bus="b", carrier="gas", p_nom=200, marginal_cost=500)
+    n.add("Load", "l", bus="b", p_set=[20, 90, 30, 80])
+    n.snapshots = pd.MultiIndex.from_product([[2020, 2030], n.snapshots])
+    n.investment_periods = [2020, 2030]
+    return n
+
+
+@pytest.fixture
 def ac_dc_stochastic():
     n = pypsa.examples.ac_dc_meshed()
     n.set_scenarios({"low": 0.3, "high": 0.7})
+    return n
+
+
+@pytest.fixture
+def committable_stochastic():
+    n = pypsa.Network()
+    n.set_snapshots(pd.date_range("2024-01-01", periods=6, freq="h"))
+    n.add("Bus", "b")
+    n.add("Carrier", "gas")
+    n.add(
+        "Generator",
+        "cheap",
+        bus="b",
+        carrier="gas",
+        p_nom=80,
+        marginal_cost=20,
+        committable=True,
+        p_min_pu=0.4,
+        start_up_cost=500,
+    )
+    n.add("Generator", "peak", bus="b", carrier="gas", p_nom=500, marginal_cost=200)
+    n.add("Load", "l", bus="b", p_set=0.0)
+    n.set_scenarios({"low": 0.4, "high": 0.6})
+    n.c.loads.dynamic.p_set[("low", "l")] = [30, 40, 50, 40, 30, 20]
+    n.c.loads.dynamic.p_set[("high", "l")] = [70, 90, 120, 110, 80, 60]
+    return n
+
+
+@pytest.fixture
+def extendable_stochastic():
+    n = pypsa.Network()
+    n.set_snapshots(pd.date_range("2024-01-01", periods=6, freq="h"))
+    n.add("Bus", "b")
+    n.add("Carrier", "gas")
+    n.add("Generator", "base", bus="b", carrier="gas", p_nom=40, marginal_cost=20)
+    n.add(
+        "Generator",
+        "peak",
+        bus="b",
+        carrier="gas",
+        p_nom=0,
+        p_nom_extendable=True,
+        capital_cost=300,
+        marginal_cost=100,
+    )
+    n.add("Load", "l", bus="b", p_set=0.0)
+    n.set_scenarios({"low": 0.4, "high": 0.6})
+    n.c.loads.dynamic.p_set[("low", "l")] = [30, 40, 50, 40, 30, 20]
+    n.c.loads.dynamic.p_set[("high", "l")] = [70, 90, 120, 110, 80, 60]
     return n
 
 
