@@ -363,7 +363,7 @@ class NimoptModel:
         `members` names, per dimension, the labels the constraint states rows
         for where they are a subset of a set.
         """
-        constraint = self.model.eq(name, relation, **kwargs)
+        constraint = self.model.constraint(name, relation, **kwargs)
         sets = tuple(self.sets[d] for d in constraint.frame)
         dims, coords = self._frame(sets)
         self.constraints[name] = NimoptConstraint(
