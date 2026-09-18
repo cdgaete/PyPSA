@@ -10,15 +10,24 @@ solution. What it does not state it refuses by name, and each refusal is
 checked here rather than left to a network that silently omits a row.
 """
 
+import re
+
 import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
+from linopy.constants import BREAKPOINT_DIM
 
 import pypsa
+from pypsa.optimization.piecewise import PiecewiseOptions
 
 no = pytest.importorskip("nimopt")
 
+from pypsa.optimization.nimopt_backend.piecewise import (  # noqa: E402
+    breakpoint_param,
+    option_groups,
+    resolve_method,
+)
 from pypsa.optimization.nimopt_backend.scenarios import (  # noqa: E402
     Scenarios,
     columns_of,
@@ -2035,3 +2044,163 @@ def test_a_fixed_modular_commitment_is_refused_by_name():
     n = modular_committable(extendable=False)
     with pytest.raises(NotImplementedError, match="committable modular"):
         n.optimize.create_model(backend="nimopt")
+
+
+# --- piecewise attributes: method, option groups, breakpoints ---------------
+
+
+def points(rows):
+    """Breakpoints over `name` and linopy's breakpoint dimension, one row per name."""
+    width = max(len(row) for row in rows.values())
+    values = [list(row) + [np.nan] * (width - len(row)) for row in rows.values()]
+    return xr.DataArray(
+        np.array(values, dtype=float),
+        coords={"name": list(rows), BREAKPOINT_DIM: np.arange(width)},
+        dims=("name", BREAKPOINT_DIM),
+    )
+
+
+CONVEX = ({"a": [0, 50, 100]}, {"a": [0, 50, 250]})
+CONCAVE = ({"a": [0, 50, 100]}, {"a": [0, 30, 55]})
+RESOLVED = [
+    ("convex under >=", "auto", ">=", False, *CONVEX, "tangent"),
+    ("concave under >=", "auto", ">=", False, *CONCAVE, "incremental"),
+    ("convex under <=", "auto", "<=", False, *CONVEX, "incremental"),
+    ("concave under <=", "auto", "<=", False, *CONCAVE, "tangent"),
+    ("a status", "auto", ">=", True, *CONVEX, "incremental"),
+    ("equality", "auto", "==", False, *CONVEX, "incremental"),
+    # linopy resolves sos2 here: y is not strictly monotonic
+    (
+        "flat y",
+        "auto",
+        "==",
+        False,
+        {"a": [0, 10, 50, 100]},
+        {"a": [0, 3, 10, 10]},
+        "incremental",
+    ),
+    (
+        "one convex and one concave",
+        "auto",
+        ">=",
+        False,
+        {"a": [0, 50, 100], "b": [0, 50, 100]},
+        {"a": [0, 50, 250], "b": [0, 30, 55]},
+        "incremental",
+    ),
+    (
+        "a two-point curve beside a convex one",
+        "auto",
+        ">=",
+        False,
+        {"a": [0, 50, 100], "b": [0, 100]},
+        {"a": [0, 50, 250], "b": [0, 20]},
+        "tangent",
+    ),
+    ("lp", "lp", "==", False, *CONVEX, "tangent"),
+    ("incremental", "incremental", ">=", False, *CONVEX, "incremental"),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "requested", "sign", "status", "x", "y", "method"), RESOLVED
+)
+def test_the_method_resolves_as_linopys_auto_resolves(
+    label, requested, sign, status, x, y, method
+):
+    resolved = resolve_method(
+        requested,
+        sign,
+        has_status=status,
+        x_points=points(x),
+        y_points=points(y),
+        owner="the curve",
+    )
+    assert resolved == method
+
+
+def test_method_sos2_is_not_supported():
+    message = (
+        "method 'sos2' of the curve is not supported by the nimopt backend; "
+        "use method 'auto', 'lp' or 'incremental'"
+    )
+    with pytest.raises(NotImplementedError, match=re.escape(message)):
+        resolve_method(
+            "sos2",
+            ">=",
+            has_status=False,
+            x_points=points(CONVEX[0]),
+            y_points=points(CONVEX[1]),
+            owner="the curve",
+        )
+
+
+def test_x_breakpoints_that_repeat_are_not_supported():
+    message = (
+        "the curve has x breakpoints that are not strictly monotonic; give "
+        "strictly increasing x breakpoints"
+    )
+    with pytest.raises(NotImplementedError, match=re.escape(message)):
+        resolve_method(
+            "auto",
+            ">=",
+            has_status=False,
+            x_points=points({"a": [0, 50, 50, 100]}),
+            y_points=points({"a": [0, 10, 20, 30]}),
+            owner="the curve",
+        )
+
+
+def test_an_unknown_method_raises():
+    message = (
+        "method of the curve is one of ('auto', 'lp', 'incremental', 'sos2'); "
+        "got 'spline'"
+    )
+    with pytest.raises(ValueError, match=re.escape(message)):
+        resolve_method(
+            "spline",
+            ">=",
+            has_status=False,
+            x_points=points(CONVEX[0]),
+            y_points=points(CONVEX[1]),
+            owner="the curve",
+        )
+
+
+def listed(groups):
+    return [
+        (suffix, list(names), method, sign) for suffix, names, method, sign in groups
+    ]
+
+
+def test_options_form_groups_in_pypsas_order():
+    names = pd.Index(["a", "b", "c", "d"], name="name")
+    options = [
+        PiecewiseOptions(
+            "Generator", "marginal_cost", ">=", name="a", method="incremental"
+        ),
+        PiecewiseOptions(
+            "Generator", "marginal_cost", "<=", name=("c", "x"), method="lp"
+        ),
+    ]
+    # the named options sort by name in reverse: ("c", "x") before ("a",)
+    assert listed(option_groups(names, options, ">=")) == [
+        ("-option0", ["c"], "lp", "<="),
+        ("-option1", ["a"], "incremental", ">="),
+        ("", ["b", "d"], "auto", ">="),
+    ]
+
+
+def test_an_option_without_names_covers_every_remaining_name():
+    names = pd.Index(["a", "b"], name="name")
+    options = [PiecewiseOptions("Generator", "marginal_cost", "<=", method="lp")]
+    assert listed(option_groups(names, options, ">=")) == [("", ["a", "b"], "lp", "<=")]
+
+
+def test_a_breakpoint_parameter_has_a_value_at_each_valid_breakpoint():
+    N = no.Set("Generator", np.array(["a", "b"]))
+    B = no.Set("curve_breakpoint", np.arange(3))
+    x = points({"a": [0, 50, 100], "b": [0, 100]})
+    held = breakpoint_param("curve-x_points", (N, B), x, x.notnull())
+    assert held.name == "curve_x_points"
+    assert held.materialise().values().tolist() == [0.0, 50.0, 100.0, 0.0, 100.0]
