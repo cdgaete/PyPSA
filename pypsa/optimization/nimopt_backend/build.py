@@ -132,7 +132,7 @@ def _refuse_unsupported(
                 continue
             if n.has_scenarios:
                 reasons.append(f"piecewise {c.name} {attr} under scenarios")
-            elif attr != "marginal_cost":
+            elif attr not in ("marginal_cost", "capital_cost"):
                 reasons.append(f"piecewise {c.name} {attr}")
         if c.name not in {name for name, _ in RAMPING}:
             for col in ("ramp_limit_up", "ramp_limit_down"):
@@ -3103,6 +3103,19 @@ def declare_piecewise(
     return curved
 
 
+def _require_no_overnight_cost(c: Any, curved: pd.Index) -> None:
+    """Raise ValueError where a component with a capital cost curve has an overnight cost."""
+    overnight = c.static["overnight_cost"].loc[curved]
+    if overnight.notna().any():
+        bad = overnight[overnight.notna()].index.tolist()
+        msg = (
+            f"Components {bad} of type {c.name} define both a piecewise "
+            "'capital_cost' curve and 'overnight_cost'. The piecewise "
+            "curve must already be periodized; remove 'overnight_cost'."
+        )
+        raise ValueError(msg)
+
+
 def define_objective(
     n: Network,
     m: NimoptModel,
@@ -3138,6 +3151,36 @@ def define_objective(
         ext = c.extendables.intersection(c.active_assets)
         if ext.empty:
             continue
+        curved = pd.Index([], name="name")
+        if not c._piecewise_schema("capital_cost").empty:
+            curved = declare_piecewise(
+                n,
+                m,
+                c,
+                attr="capital_cost",
+                names=ext,
+                sign=">=",
+                cumulative=True,
+                timed=False,
+                options=_options_for(piecewise_options, c, "capital_cost"),
+                sns=sns,
+                sc=sc,
+                pe=pe,
+            )
+        if not curved.empty:
+            _require_no_overnight_cost(c, curved)
+            N = m.sets[c_name]
+            aux = c._piecewise_aux_var("capital_cost")
+            ones = xr.DataArray(
+                np.ones(len(curved)), coords={"name": _names(curved)}, dims=("name",)
+            )
+            active_weight = sc.over(
+                ones * _active_periods(n, c, sns, curved, sc=sc, pe=pe), ("name",)
+            )
+            price = _long_of(
+                f"{aux}-weight", sc.sets + (N,), active_weight * sc.probability
+            )
+            terms.append(Sum(*sc.sets, N, price[*sc.sets, N] * m.var(aux)[N]))
         held = c.periodized_cost.sel(name=ext)
         if held.size == 0:
             continue
@@ -3145,7 +3188,7 @@ def define_objective(
         cost = cost * sc.probability
         if not pe:
             constant += float((cost * sc.static(c, attr, ext)).sum())
-        live = cost.to_numpy() != 0
+        live = (cost.to_numpy() != 0) & ~np.isin(_names(ext), _names(curved))
         if live.any():
             N = m.sets[c_name]
             price = _long_of(

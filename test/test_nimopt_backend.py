@@ -2540,3 +2540,78 @@ def test_a_cost_curve_over_investment_periods_prices_as_its_linear_cost():
         linear.c["Generator"].dynamic["p"].to_numpy(),
         atol=1e-9,
     )
+
+
+# --- piecewise attributes: capital cost --------------------------------------
+
+
+def capital_costs(periods=False):
+    """An extendable generator with a capital cost curve beside a linear one."""
+    n = pypsa.Network(snapshots=range(2))
+    if periods:
+        n.investment_periods = [2020, 2030]
+    n.add("Bus", "bus0")
+    lived = {"build_year": 2020, "lifetime": 30} if periods else {}
+    n.add(
+        "Generator",
+        "gen0",
+        bus="bus0",
+        p_nom_extendable=True,
+        p_nom_max=100,
+        capital_cost=1.8,
+        marginal_cost=1,
+        **lived,
+    )
+    n.add(
+        "Generator",
+        "gen1",
+        bus="bus0",
+        p_nom_extendable=True,
+        p_nom_max=100,
+        capital_cost=pd.DataFrame(
+            {"p_nom": [0.0, 10, 50, 100.0], "capital_cost": [0.0, 1, 1.5, 2.0]}
+        ),
+        marginal_cost=2,
+        **lived,
+    )
+    n.add("Load", "load", bus="bus0", p_set=150 if periods else [150, 120])
+    return n, {"multi_investment_periods": True} if periods else {}
+
+
+CAPITAL_CURVES = {
+    "one period": capital_costs,
+    "two investment periods": lambda: capital_costs(periods=True),
+}
+
+
+@pytest.mark.parametrize("label", sorted(CAPITAL_CURVES))
+def test_a_capital_cost_curve_reaches_the_optimum_linopy_reaches(label):
+    assert_same_as_linopy(CAPITAL_CURVES[label])
+
+
+@pytest.mark.parametrize("label", sorted(CAPITAL_CURVES))
+def test_a_capital_cost_curve_resolves_the_method_linopy_resolves(label):
+    assert_same_method(CAPITAL_CURVES[label])
+
+
+def test_a_capital_cost_curve_with_an_overnight_cost_raises():
+    n = pypsa.Network(snapshots=range(2))
+    n.add("Bus", "bus0")
+    n.add(
+        "Generator",
+        "gen0",
+        bus="bus0",
+        p_nom_extendable=True,
+        p_nom_max=100,
+        capital_cost={0.0: 2.0, 100.0: 2.0},
+        overnight_cost=1000,
+        lifetime=20,
+        discount_rate=0.05,
+    )
+    n.add("Load", "load", bus="bus0", p_set=50)
+    message = (
+        "Components ['gen0'] of type Generator define both a piecewise "
+        "'capital_cost' curve and 'overnight_cost'."
+    )
+    with pytest.raises(ValueError, match=re.escape(message)):
+        n.optimize.create_model(backend="nimopt", include_objective_constant=False)
