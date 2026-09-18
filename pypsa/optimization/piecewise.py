@@ -143,27 +143,18 @@ def define_piecewise(
     if y_var is None:
         y_var = _create_y_var(m, x_var, pw_names, aux_var_name)
     y_var_sel = y_var.sel(name=pw_names)
-    sorted_options = sorted(extra_options, key=lambda x: x.name, reverse=True)
-    for option in [*sorted_options, None]:
-        if option is None:
-            names, aux, opt_method, opt_sign = (
-                pw_names,
-                aux_var_name,
-                method,
-                sign,
-            )
-        elif option.name:
-            names = pd.Index(option.name, name="name").intersection(pw_names)
+    for option, names, opt_method, opt_sign in piecewise_option_groups(
+        pw_names, extra_options, method, sign
+    ):
+        if names.empty:
+            continue
+        if option is not None and option.name:
             aux_suffix = (
                 "_".join(names) if len(names) <= 3 else f"{names[0]}_..._{names[-1]}"
             )
             aux = f"{aux_var_name}_{aux_suffix}"
-            opt_method, opt_sign = option.method, option.sign
         else:
-            names, aux = pw_names, aux_var_name
-            opt_method, opt_sign = option.method, option.sign
-        if names.empty:
-            continue
+            aux = aux_var_name
 
         if status is None:
             active = None
@@ -190,8 +181,53 @@ def define_piecewise(
                 name=aux,
                 active=active,
             )
-        pw_names = pw_names.difference(names)
     return y_var_sel
+
+
+def piecewise_option_groups(
+    pw_names: pd.Index,
+    extra_options: Iterable[PiecewiseOptions],
+    method: str,
+    sign: str,
+) -> list[tuple[PiecewiseOptions | None, pd.Index, str, str]]:
+    """Return the option, names, method and sign of each piecewise constraint.
+
+    Options with names come first, sorted by name in reverse, and each covers
+    the names it lists that no earlier option covers. An option without names
+    covers every remaining name. The last group has no option and covers the
+    names no option covers, with `method` and `sign`. A group may have no name.
+
+    Parameters
+    ----------
+    pw_names : pd.Index
+        Component names with the piecewise attribute.
+    extra_options : Iterable[PiecewiseOptions]
+        The piecewise options for the component and attribute.
+    method : str
+        The method of the last group.
+    sign : SIGNS_T
+        The sign of the last group.
+
+    Returns
+    -------
+    list of tuple
+        One ``(option, names, method, sign)`` per option, and one for the rest.
+
+    """
+    groups = []
+    remaining = pw_names
+    ordered = sorted(extra_options, key=lambda x: x.name, reverse=True)
+    for option in [*ordered, None]:
+        if option is None:
+            names, opt_method, opt_sign = remaining, method, sign
+        elif option.name:
+            names = pd.Index(option.name, name="name").intersection(remaining)
+            opt_method, opt_sign = option.method, option.sign
+        else:
+            names, opt_method, opt_sign = remaining, option.method, option.sign
+        groups.append((option, names, opt_method, opt_sign))
+        remaining = remaining.difference(names)
+    return groups
 
 
 def get_piecewise_names(c: Any, pw_attr: str, active_names: pd.Index) -> pd.Index:

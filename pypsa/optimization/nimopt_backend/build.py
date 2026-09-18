@@ -30,7 +30,6 @@ from pypsa.optimization.nimopt_backend.model import NimoptModel, _symbol
 from pypsa.optimization.nimopt_backend.periods import Periods
 from pypsa.optimization.nimopt_backend.piecewise import (
     SIGNS,
-    breakpoint_param,
     option_groups,
     resolve_method,
 )
@@ -40,6 +39,7 @@ from pypsa.optimization.nimopt_backend.scenarios import (
     readable,
     time_coords,
 )
+from pypsa.optimization.optimize import check_no_overnight_cost
 from pypsa.optimization.piecewise import _get_breakpoints, get_piecewise_names
 from pypsa.optimization.window import SnapshotWindow
 
@@ -164,13 +164,8 @@ def _refuse_unsupported(
 
 
 def _names(index: pd.Index) -> np.ndarray:
-    """Component names as the label array a nimopt set or parameter reads.
-
-    The labels carry a string dtype rather than object, because a file saves
-    them with `numpy.savez`, which pickles an object array silently and reads
-    nothing back under `allow_pickle=False`.
-    """
-    return np.asarray(index, dtype=str)
+    """Return component names as the labels of a nimopt set or parameter."""
+    return readable(np.asarray(index))
 
 
 def _per_component(c: Any, column: str, names: pd.Index, dtype: Any) -> np.ndarray:
@@ -223,7 +218,7 @@ DIM_OF_SET = {
 }
 
 
-def _by_set(sets: tuple, columns: dict) -> dict:
+def _by_set(sets: tuple, columns: dict, dims_of: dict | None = None) -> dict:
     """Key a reader's label columns by the set each dimension is declared over.
 
     A reader names its axes `scenario`, `name`, `period` and `timestep`, and a
@@ -231,8 +226,9 @@ def _by_set(sets: tuple, columns: dict) -> dict:
     paired by dimension name rather than by position.
     """
     held = {}
+    known = {**DIM_OF_SET, **(dims_of or {})}
     for s in sets:
-        dims = DIM_OF_SET.get(s.name, ("name",))
+        dims = known.get(s.name, ("name",))
         found = [d for d in dims if d in columns]
         if not found:
             msg = f"A reader answered no {dims} dimension for set {s.name!r}."
@@ -248,12 +244,35 @@ def _sparse_of(name: str, sets: tuple, da: xr.DataArray) -> Param:
 
 
 def _long_of(
-    name: str, sets: tuple, da: xr.DataArray, keep: np.ndarray | None = None
+    name: str,
+    sets: tuple,
+    da: xr.DataArray,
+    keep: np.ndarray | None = None,
+    dims_of: dict | None = None,
 ) -> Param:
-    """Build a parameter valued at every cell of the array, or at the cells `keep` marks."""
+    """Build a parameter valued at every cell of the array, or at the cells `keep` marks.
+
+    `dims_of` maps a set name to the array dimensions it reads, beside
+    `DIM_OF_SET`.
+    """
     mask = np.ones(da.shape, dtype=bool) if keep is None else np.asarray(keep)
     columns, values = columns_of(da, mask)
-    return Param.from_long(_symbol(name), sets, _by_set(sets, columns), values)
+    return Param.from_long(_symbol(name), sets, _by_set(sets, columns, dims_of), values)
+
+
+def breakpoint_param(
+    name: str, sets: tuple, points: xr.DataArray, valid: xr.DataArray
+) -> Param:
+    """Return a parameter over a component set and a breakpoint set.
+
+    The parameter has a value at each breakpoint `valid` marks and `points`
+    has a value at.
+    """
+    held = points.transpose("name", BREAKPOINT_DIM)
+    keep = (
+        valid.transpose("name", BREAKPOINT_DIM).to_numpy() & held.notnull().to_numpy()
+    )
+    return _long_of(name, sets, held, keep, {sets[1].name: (BREAKPOINT_DIM,)})
 
 
 def _at_snapshots(pe: Periods, T: Any, sns: pd.Index, at: np.ndarray) -> dict:
@@ -1569,7 +1588,7 @@ def _incidence(
         return Param.from_long(
             _symbol(name), (B, N), {B.name: at_bus, N.name: names}, values
         )
-    labels = np.asarray(sc.names, dtype=str)
+    labels = readable(np.asarray(sc.names))
     return Param.from_long(
         _symbol(name),
         sc.sets + (B, N),
@@ -1661,7 +1680,7 @@ def _arrivals(
         at = np.nonzero(held)
         columns = {}
         if sc:
-            columns["scenario"] = np.asarray(sc.names, dtype=str)[at[0]]
+            columns["scenario"] = readable(np.asarray(sc.names))[at[0]]
         member_at, snapshot_at = (at[1], at[2]) if sc else (at[0], at[1])
         columns[B.name] = reaching[varying][member_at]
         columns[K.name] = member[varying][member_at]
@@ -1819,9 +1838,7 @@ def define_nodal_balance_constraints(
                         )
                     )
 
-    balance = terms[0]
-    for term in terms[1:]:
-        balance = balance + term
+    balance = _sum_terms(terms)
 
     leading = (len(sc.names),) if sc else ()
     load = np.zeros((*leading, len(buses), len(sns)))
@@ -1885,7 +1902,7 @@ def _cycle_law(
     at = np.nonzero(grid)
     columns: dict = {}
     if sc:
-        labels = np.asarray(sc.names, dtype=str)
+        labels = readable(np.asarray(sc.names))
         held = len(at[0])
         columns["scenario"] = np.repeat(labels, held)
         columns[C.name] = np.tile(cycles[at[0]], len(labels))
@@ -1955,9 +1972,7 @@ def define_kirchhoff_voltage_constraints(
         terms.append(
             Sum(N, law[*sc.sets, C, N] * m.var(f"{c_name}-s")[*sc.sets, N, *pe.sets, T])
         )
-    lhs = terms[0]
-    for term in terms[1:]:
-        lhs = lhs + term
+    lhs = _sum_terms(terms)
 
     rhs: Any = 0.0
     if "Transformer" in weighted.index.unique("type"):
@@ -2450,7 +2465,7 @@ def _limit(name: str, constants: np.ndarray, sc: Scenarios) -> Any:
         return float(constants[0])
     da = xr.DataArray(
         constants,
-        coords={"scenario": np.asarray(sc.names, dtype=str)},
+        coords={"scenario": readable(np.asarray(sc.names))},
         dims=("scenario",),
     )
     return _long_of(name, sc.sets, da)[*sc.sets]
@@ -2731,9 +2746,7 @@ def define_primary_energy_limit(
 
         if not terms:
             continue
-        lhs = terms[0]
-        for term in terms[1:]:
-            lhs = lhs + term
+        lhs = _sum_terms(terms)
         limit = _limit(f"GlobalConstraint-{name}-limit", constant, sc)
         m.add_constraints(f"GlobalConstraint-{name}", _relation(lhs, glc.sense, limit))
 
@@ -2797,9 +2810,7 @@ def define_operational_limit(
         constant = constant + adjusted
         if not terms:
             continue
-        lhs = terms[0]
-        for term in terms[1:]:
-            lhs = lhs + term
+        lhs = _sum_terms(terms)
         limit = _limit(f"GlobalConstraint-{name}-limit", constant, sc)
         m.add_constraints(f"GlobalConstraint-{name}", _relation(lhs, glc.sense, limit))
 
@@ -2983,9 +2994,7 @@ def define_growth_limit(
         terms.append(Sum(N, coefficient[C, N, P] * m.var(f"{c_name}-{attr}")[N]))
     if not terms:
         return
-    lhs = terms[0]
-    for term in terms[1:]:
-        lhs = lhs + term
+    lhs = _sum_terms(terms)
     over = np.asarray(pe.names)
     bound = Param.from_long(
         "Carrier_growth_limit",
@@ -3003,9 +3012,7 @@ def _add_global(
     m: NimoptModel, name: str, terms: list, sense: str, constant: Any
 ) -> None:
     """State one global constraint from the terms its limit sums."""
-    lhs = terms[0]
-    for term in terms[1:]:
-        lhs = lhs + term
+    lhs = _sum_terms(terms)
     m.add_constraints(f"GlobalConstraint-{name}", _relation(lhs, sense, constant))
 
 
@@ -3186,19 +3193,6 @@ def declare_piecewise(
     return curved
 
 
-def _require_no_overnight_cost(c: Any, curved: pd.Index) -> None:
-    """Raise ValueError where a component with a capital cost curve has an overnight cost."""
-    overnight = c.static["overnight_cost"].loc[curved]
-    if overnight.notna().any():
-        bad = overnight[overnight.notna()].index.tolist()
-        msg = (
-            f"Components {bad} of type {c.name} define both a piecewise "
-            "'capital_cost' curve and 'overnight_cost'. The piecewise "
-            "curve must already be periodized; remove 'overnight_cost'."
-        )
-        raise ValueError(msg)
-
-
 def define_objective(
     n: Network,
     m: NimoptModel,
@@ -3251,7 +3245,7 @@ def define_objective(
                 pe=pe,
             )
         if not curved.empty:
-            _require_no_overnight_cost(c, curved)
+            check_no_overnight_cost(c, curved)
             N = m.sets[c_name]
             aux = c._piecewise_aux_var("capital_cost")
             ones = xr.DataArray(

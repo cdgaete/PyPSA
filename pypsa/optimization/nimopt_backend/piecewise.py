@@ -2,22 +2,21 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Method selection, option groups and breakpoint parameters for piecewise curves."""
+"""Method selection and option groups for piecewise curves."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
-import pandas as pd
 from linopy.constants import BREAKPOINT_DIM
-from nimopt import Param
 
-from pypsa.optimization.nimopt_backend.model import _symbol
+from pypsa.optimization.piecewise import piecewise_option_groups
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
+    import pandas as pd
     import xarray as xr
 
     from pypsa.optimization.piecewise import PiecewiseOptions
@@ -103,42 +102,15 @@ def option_groups(
     name. The names no option covers form the last group, with the method
     "auto" and `sign`. A group with no name is omitted.
     """
-    remaining = names
     groups = []
-    ordered = sorted(options, key=lambda option: option.name, reverse=True)
     named = 0
-    for option in [*ordered, None]:
-        if option is None:
-            covered, suffix, method, held = remaining, "", "auto", sign
-        elif option.name:
-            covered = pd.Index(option.name, name="name").intersection(remaining)
-            suffix, method, held = f"-option{named}", option.method, option.sign
+    for option, covered, method, held in piecewise_option_groups(
+        names, options, "auto", sign
+    ):
+        suffix = ""
+        if option is not None and option.name:
+            suffix = f"-option{named}"
             named += 1
-        else:
-            covered, suffix, method, held = remaining, "", option.method, option.sign
-        if covered.empty:
-            continue
-        groups.append((suffix, covered, method, held))
-        remaining = remaining.difference(covered)
+        if not covered.empty:
+            groups.append((suffix, covered, method, held))
     return groups
-
-
-def breakpoint_param(
-    name: str, sets: tuple, points: xr.DataArray, valid: xr.DataArray
-) -> Param:
-    """Return a parameter over a component set and a breakpoint set.
-
-    The parameter has a value at each breakpoint `valid` marks and `points`
-    has a value at.
-    """
-    held = points.transpose("name", BREAKPOINT_DIM)
-    mask = (
-        valid.transpose("name", BREAKPOINT_DIM).to_numpy() & held.notnull().to_numpy()
-    )
-    at = np.nonzero(mask)
-    N, B = sets
-    columns: dict[str, Any] = {
-        N.name: np.asarray(held.indexes["name"], dtype=str)[at[0]],
-        B.name: np.asarray(held.indexes[BREAKPOINT_DIM])[at[1]],
-    }
-    return Param.from_long(_symbol(name), sets, columns, held.to_numpy()[at])

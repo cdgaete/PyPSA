@@ -149,6 +149,28 @@ def _resolve_include_objective_constant(
     return value
 
 
+def check_no_overnight_cost(c: Any, pw_names: pd.Index) -> None:
+    """Raise ValueError where a component with a capital cost curve has an overnight cost.
+
+    Parameters
+    ----------
+    c : Components
+        The components with a piecewise 'capital_cost' curve.
+    pw_names : pd.Index
+        The names of the components with a curve.
+
+    """
+    overnight = c.static["overnight_cost"].loc[pw_names]
+    if overnight.notna().any():
+        bad = overnight[overnight.notna()].index.tolist()
+        msg = (
+            f"Components {bad} of type {c.name} define both a piecewise "
+            "'capital_cost' curve and 'overnight_cost'. The piecewise "
+            "curve must already be periodized; remove 'overnight_cost'."
+        )
+        raise ValueError(msg)
+
+
 def define_objective(
     n: Network,
     sns: pd.Index,
@@ -389,15 +411,7 @@ def define_objective(
             )
             if piecewise_var is not None:
                 pw_names = piecewise_var.indexes["name"]
-                overnight = c.static["overnight_cost"].loc[pw_names]
-                if overnight.notna().any():
-                    bad = overnight[overnight.notna()].index.tolist()
-                    msg = (
-                        f"Components {bad} of type {c.name} define both a piecewise "
-                        "'capital_cost' curve and 'overnight_cost'. The piecewise "
-                        "curve must already be periodized; remove 'overnight_cost'."
-                    )
-                    raise ValueError(msg)
+                check_no_overnight_cost(c, pw_names)
                 ext_i = ext_i.difference(pw_names)
                 pw_weight = cost_weight.sel(name=pw_names)
                 capex_terms.append((piecewise_var * pw_weight).sum(dim=sum_dim))

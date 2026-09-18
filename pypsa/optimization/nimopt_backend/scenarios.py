@@ -15,11 +15,10 @@ import xarray as xr
 
 
 def readable(values: np.ndarray) -> np.ndarray:
-    """Return labels a file can save.
+    """Return labels a nimopt file can save.
 
-    An object array is read as strings, because a file saves labels with
-    `numpy.savez`, which pickles an object array silently and reads nothing
-    back under `allow_pickle=False`.
+    An object array is converted to strings. nimopt raises ValueError when it
+    saves a set whose labels are an object array.
     """
     return values.astype(str) if values.dtype.hasobject else values
 
@@ -75,7 +74,7 @@ class Scenarios:
         self.names = names
         self.weights = weights
         self._set = (
-            no.Set("scenario", np.asarray(names, dtype=str))
+            no.Set("scenario", readable(np.asarray(names)))
             if names is not None
             else None
         )
@@ -108,7 +107,7 @@ class Scenarios:
     @property
     def labels(self) -> tuple:
         """The label arrays a family prepends to its own."""
-        return (np.asarray(self.names, dtype=str),) if self.names is not None else ()
+        return (readable(np.asarray(self.names)),) if self.names is not None else ()
 
     @property
     def probability(self) -> Any:
@@ -122,7 +121,7 @@ class Scenarios:
             return 1.0
         return xr.DataArray(
             self.weights,
-            coords={"scenario": np.asarray(self.names, dtype=str)},
+            coords={"scenario": readable(np.asarray(self.names))},
             dims=("scenario",),
         )
 
@@ -185,8 +184,8 @@ class Scenarios:
         """
         coords: dict = {}
         if self.names is not None:
-            coords["scenario"] = np.asarray(self.names, dtype=str)
-        coords["name"] = np.asarray(names, dtype=str)
+            coords["scenario"] = readable(np.asarray(self.names))
+        coords["name"] = readable(np.asarray(names))
         dims = (*coords, "snapshot") if sns is not None else tuple(coords)
         shape = tuple(len(coords[d]) for d in coords)
         if sns is not None:

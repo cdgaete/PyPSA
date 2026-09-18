@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from pypsa.optimization.nimopt_backend.scenarios import readable
+
 # nimopt status -> (linopy solver status, linopy termination condition)
 STATUS: dict[str, tuple[str, str]] = {
     "optimal": ("ok", "optimal"),
@@ -314,10 +316,7 @@ class NimoptModel:
             msg = f"Set {name!r} is already declared."
             raise ValueError(msg)
         index = labels if isinstance(labels, pd.Index) else pd.Index(labels)
-        members = index.to_numpy()
-        if members.dtype.hasobject:
-            members = members.astype(str)
-        held = no.Set(name, members)
+        held = no.Set(name, readable(index.to_numpy()))
         self.sets[name] = held
         self._dim_of[name] = dim
         self._labels[name] = index

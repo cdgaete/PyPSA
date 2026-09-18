@@ -23,9 +23,9 @@ from pypsa.optimization.piecewise import PiecewiseOptions
 
 no = pytest.importorskip("nimopt")
 
+from pypsa.optimization.nimopt_backend.build import breakpoint_param  # noqa: E402
 from pypsa.optimization.nimopt_backend.model import _symbol  # noqa: E402
 from pypsa.optimization.nimopt_backend.piecewise import (  # noqa: E402
-    breakpoint_param,
     option_groups,
     resolve_method,
 )
@@ -133,13 +133,9 @@ def test_the_families_keep_the_names_pypsa_reads_them_by(ac_dc_network):
     assert any("-" in name for name in wrapper.constraints)
 
 
-def test_no_domain_the_file_cannot_name_reaches_the_model(ac_dc_network):
-    from nimblend import Domain
-
-    model = inner(ac_dc_network)
-    nameless = [n for n, v in model.variables.items() if isinstance(v.subset, Domain)]
-    nameless += [n for n, c in model.constraints.items() if isinstance(c.over, Domain)]
-    assert nameless == []
+def test_no_domain_the_file_cannot_name_reaches_the_model(ac_dc_network, tmp_path):
+    # save raises ValueError for a subset, a condition or a where with no name
+    no.save(inner(ac_dc_network), tmp_path / "model")
 
 
 # --- ramp limits ------------------------------------------------------------
