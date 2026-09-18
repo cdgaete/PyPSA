@@ -400,11 +400,7 @@ class NimoptModel:
     @property
     def has_duals(self) -> bool:
         """Whether the last solve produced duals PyPSA can assign."""
-        return (
-            self.solution is not None
-            and self.solution.status == "optimal"
-            and not self.model.integrality().any()
-        )
+        return self.solution is not None and self.solution.has_duals
 
     def solve(
         self, solver_name: str = "highs", progress: bool = False, **kwargs: Any

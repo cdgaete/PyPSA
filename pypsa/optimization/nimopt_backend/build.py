@@ -3164,12 +3164,7 @@ def declare_piecewise(
     for suffix, covered, requested, held in option_groups(curved, options, sign):
         with_status = covered.intersection(committed)
         method = resolve_method(
-            requested,
-            SIGNS[held],
-            has_status=not with_status.empty,
-            x_points=x_points.sel(name=covered),
-            y_points=y_points.sel(name=covered),
-            owner=owner,
+            requested, has_status=not with_status.empty, owner=owner
         )
         for part, tag in (
             (covered.difference(with_status), ""),

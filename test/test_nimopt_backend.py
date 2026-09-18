@@ -2094,9 +2094,23 @@ RESOLVED = [
         {"a": [0, 50, 250], "b": [0, 20]},
         "tangent",
     ),
-    ("lp", "lp", "==", False, *CONVEX, "tangent"),
     ("incremental", "incremental", ">=", False, *CONVEX, "incremental"),
 ]
+
+
+def formulation(requested, sign, status, x, y):
+    """Return the method nimopt generates for curves under the resolved method."""
+    method = resolve_method(requested, has_status=status, owner="the curve")
+    xp, yp = points(x), points(y)
+    N = no.Set("N", np.array(list(x)))
+    B = no.Set("B", np.arange(xp.sizes[BREAKPOINT_DIM]))
+    m = no.Model("curve")
+    p = m.var("p", (N,))
+    c = m.var("c", (N,), lower=-np.inf)
+    xq = breakpoint_param("xq", (N, B), xp, xp.notnull())
+    yq = breakpoint_param("yq", (N, B), yp, yp.notnull())
+    declared = m.piecewise("curve", p[N], xq[N, B], c[N], yq[N, B], sign, method)
+    return declared.formulation
 
 
 @pytest.mark.parametrize(
@@ -2105,15 +2119,13 @@ RESOLVED = [
 def test_the_method_resolves_as_linopys_auto_resolves(
     label, requested, sign, status, x, y, method
 ):
-    resolved = resolve_method(
-        requested,
-        sign,
-        has_status=status,
-        x_points=points(x),
-        y_points=points(y),
-        owner="the curve",
-    )
-    assert resolved == method
+    assert formulation(requested, sign, status, x, y) == method
+
+
+def test_method_lp_with_an_equality_raises_in_nimopt():
+    message = "uses method 'tangent' with sign '=='"
+    with pytest.raises(ValueError, match=re.escape(message)):
+        formulation("lp", "==", False, *CONVEX)
 
 
 def test_method_sos2_is_not_supported():
@@ -2122,30 +2134,13 @@ def test_method_sos2_is_not_supported():
         "use method 'auto', 'lp' or 'incremental'"
     )
     with pytest.raises(NotImplementedError, match=re.escape(message)):
-        resolve_method(
-            "sos2",
-            ">=",
-            has_status=False,
-            x_points=points(CONVEX[0]),
-            y_points=points(CONVEX[1]),
-            owner="the curve",
-        )
+        resolve_method("sos2", has_status=False, owner="the curve")
 
 
-def test_x_breakpoints_that_repeat_are_not_supported():
-    message = (
-        "the curve has x breakpoints that are not strictly monotonic; give "
-        "strictly increasing x breakpoints"
-    )
-    with pytest.raises(NotImplementedError, match=re.escape(message)):
-        resolve_method(
-            "auto",
-            ">=",
-            has_status=False,
-            x_points=points({"a": [0, 50, 50, 100]}),
-            y_points=points({"a": [0, 10, 20, 30]}),
-            owner="the curve",
-        )
+def test_x_breakpoints_that_repeat_raise_in_nimopt():
+    x, y = {"a": [0, 50, 50, 100]}, {"a": [0, 10, 20, 30]}
+    with pytest.raises(ValueError, match="x_points that are not strictly monotonic"):
+        formulation("auto", ">=", False, x, y)
 
 
 def test_an_unknown_method_raises():
@@ -2154,14 +2149,7 @@ def test_an_unknown_method_raises():
         "got 'spline'"
     )
     with pytest.raises(ValueError, match=re.escape(message)):
-        resolve_method(
-            "spline",
-            ">=",
-            has_status=False,
-            x_points=points(CONVEX[0]),
-            y_points=points(CONVEX[1]),
-            owner="the curve",
-        )
+        resolve_method("spline", has_status=False, owner="the curve")
 
 
 def listed(groups):
@@ -2265,7 +2253,7 @@ def assert_same_method(build):
         }
         symbol = _symbol(stem)
         found = {
-            declaration.method
+            declaration.formulation
             for name, declaration in nimopt.piecewise_declarations.items()
             if name == symbol or name.startswith(f"{symbol}_")
         }
@@ -2469,18 +2457,14 @@ def test_a_curve_under_method_sos2_is_not_supported():
         n.optimize.create_model(backend="nimopt", piecewise_options=[option])
 
 
-def test_a_curve_with_a_repeated_x_breakpoint_is_not_supported():
+def test_a_curve_with_a_repeated_x_breakpoint_raises_in_nimopt():
     # linopy resolves sos2 for this curve
     n, _ = cost_curve(
         pd.DataFrame(
             {"p_pu": [0.0, 0.5, 0.5, 1.0], "marginal_cost": [0.0, 1.0, 2.0, 3.0]}
         )
     )
-    message = (
-        "piecewise 'marginal_cost' of Generator has x breakpoints that are not "
-        "strictly monotonic"
-    )
-    with pytest.raises(NotImplementedError, match=re.escape(message)):
+    with pytest.raises(ValueError, match="x_points that are not strictly monotonic"):
         n.optimize.create_model(backend="nimopt")
 
 
