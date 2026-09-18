@@ -2711,3 +2711,75 @@ def test_a_port_curve_reaches_the_optimum_linopy_reaches(label):
 @pytest.mark.parametrize("label", sorted(PORT_CURVES))
 def test_a_port_curve_resolves_the_method_linopy_resolves(label):
     assert_same_method(PORT_CURVES[label])
+
+
+# --- piecewise attributes: primary energy -----------------------------------
+
+
+def primary_curve(status=False):
+    """Generators whose primary energy follows an efficiency curve, under a CO2 limit."""
+    n = pypsa.Network()
+    n.add("Bus", "bus0")
+    n.add("Carrier", "gas", co2_emissions=1.0)
+    if status:
+        curve = pd.DataFrame(
+            {"p_pu": [0.0, 0.1, 0.5, 1.0], "efficiency": [0.0, 0.3, 0.3, 0.3]}
+        )
+        n.add(
+            "Generator",
+            "gen0",
+            carrier="gas",
+            bus="bus0",
+            p_nom=80,
+            marginal_cost=15,
+            efficiency=0.6,
+        )
+        for name, committable in (("committed", True), ("free", False)):
+            n.add(
+                "Generator",
+                name,
+                carrier="gas",
+                bus="bus0",
+                p_nom=70,
+                marginal_cost=20,
+                p_min_pu=0.1,
+                efficiency=curve,
+                committable=committable,
+            )
+        n.add("Load", "load", bus="bus0", p_set=80)
+    else:
+        n.add(
+            "Generator",
+            "gen",
+            carrier="gas",
+            bus="bus0",
+            p_nom=70,
+            marginal_cost=20,
+            efficiency={0.0: 0.0, 0.1: 0.2, 0.5: 0.4, 1.0: 0.6},
+        )
+        n.add("Generator", "backup", bus="bus0", p_nom=100, marginal_cost=100)
+        n.add("Load", "load", bus="bus0", p_set=50)
+    n.add(
+        "GlobalConstraint",
+        "co2_limit",
+        sense="<=",
+        carrier_attribute="co2_emissions",
+        constant=160,
+    )
+    return n, {}
+
+
+PRIMARY_CURVES = {
+    "one generator": primary_curve,
+    "committable and not": lambda: primary_curve(status=True),
+}
+
+
+@pytest.mark.parametrize("label", sorted(PRIMARY_CURVES))
+def test_a_primary_energy_curve_reaches_the_optimum_linopy_reaches(label):
+    assert_same_as_linopy(PRIMARY_CURVES[label])
+
+
+@pytest.mark.parametrize("label", sorted(PRIMARY_CURVES))
+def test_a_primary_energy_curve_resolves_the_method_linopy_resolves(label):
+    assert_same_method(PRIMARY_CURVES[label])

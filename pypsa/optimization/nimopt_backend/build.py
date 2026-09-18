@@ -132,8 +132,6 @@ def _refuse_unsupported(
                 continue
             if n.has_scenarios:
                 reasons.append(f"piecewise {c.name} {attr} under scenarios")
-            elif c.name == "Generator" and attr == "efficiency":
-                reasons.append(f"piecewise {c.name} {attr}")
         if c.name not in {name for name, _ in RAMPING}:
             for col in ("ramp_limit_up", "ramp_limit_down"):
                 if col in c.static and c.static[col].notna().any():
@@ -2618,12 +2616,46 @@ def _level_terms(
 
 
 def define_primary_energy_limit(
-    n: Network, m: NimoptModel, sns: pd.Index, sc: Scenarios, pe: Periods
+    n: Network,
+    m: NimoptModel,
+    sns: pd.Index,
+    sc: Scenarios,
+    pe: Periods,
+    *,
+    piecewise_options: Any = (),
+    linearized: bool = False,
 ) -> None:
-    """Limit a carrier attribute's total, such as emissions."""
+    """Limit a carrier attribute's total, such as emissions.
+
+    A generator with an efficiency curve contributes its primary energy
+    variable, which the curve relates to its output.
+    """
     stated = _global_limits(n, "primary_energy", sc)
     if not stated:
         return
+    gens = n.c.generators
+    curved = pd.Index([], name="name")
+    if (
+        not gens.static.empty
+        and "Generator-p" in m.variables
+        and not gens._piecewise_schema("efficiency").empty
+    ):
+        curved = declare_piecewise(
+            n,
+            m,
+            gens,
+            attr="efficiency",
+            names=gens.active_assets,
+            sign="=",
+            cumulative=False,
+            invert=True,
+            status=True,
+            options=_options_for(piecewise_options, gens, "efficiency"),
+            linearized=linearized,
+            sns=sns,
+            sc=sc,
+            pe=pe,
+        )
     T = m.sets["snapshot"]
     years = pe.per_period(n, "years") if pe else np.ones(1)
     weight = _weights(n, sns, "generators") * pe.weighting(n, "years")
@@ -2639,11 +2671,21 @@ def define_primary_energy_limit(
         terms = []
         constant = constants.copy()
 
-        gens = n.c.generators
         if not gens.static.empty:
             active = gens.active_assets
-            names = active[_carrier_of(gens, active).isin(emissions.index).to_numpy()]
-            if not names.empty:
+            emitting = active[
+                _carrier_of(gens, active).isin(emissions.index).to_numpy()
+            ]
+            for names, variable, tag in (
+                (emitting.difference(curved), "Generator-p", ""),
+                (
+                    emitting.intersection(curved),
+                    gens._piecewise_aux_var("efficiency"),
+                    "-piecewise",
+                ),
+            ):
+                if names.empty:
+                    continue
                 G = m.sets["Generator"]
                 rate = xr.DataArray(
                     np.asarray(
@@ -2652,15 +2694,15 @@ def define_primary_energy_limit(
                     coords={"name": _names(names)},
                     dims=("name",),
                 )
-                efficiency = sc.grid(gens, "efficiency", sns, names)
                 reached = _over_time(
                     np.broadcast_to(inside, (len(names), len(sns))), names, sns
                 )
-                grid = sc.over(
-                    rate * weight * reached / efficiency, ("name", "snapshot")
-                )
+                held = rate * weight * reached
+                if not tag:
+                    held = held / sc.grid(gens, "efficiency", sns, names)
+                grid = sc.over(held, ("name", "snapshot"))
                 coefficient = _sparse_of(
-                    f"{name}-generators", sc.sets + (G, *pe.sets, T), grid
+                    f"{name}-generators{tag}", sc.sets + (G, *pe.sets, T), grid
                 )
                 terms.append(
                     Sum(
@@ -2668,7 +2710,7 @@ def define_primary_energy_limit(
                         *pe.sets,
                         T,
                         coefficient[*sc.sets, G, *pe.sets, T]
-                        * m.var("Generator-p")[*sc.sets, G, *pe.sets, T],
+                        * m.var(variable)[*sc.sets, G, *pe.sets, T],
                     )
                 )
 
@@ -3430,7 +3472,9 @@ def create_model(
     define_storage_unit_constraints(n, m, sns, sc, pe)
     define_store_constraints(n, m, sns, sc, pe)
     define_total_supply_constraints(n, m, sns, sc=sc, pe=pe)
-    define_primary_energy_limit(n, m, sns, sc, pe)
+    define_primary_energy_limit(
+        n, m, sns, sc, pe, piecewise_options=options, linearized=linearized
+    )
     define_operational_limit(n, m, sns, sc, pe)
     define_tech_capacity_expansion_limit(n, m, sc)
     define_transmission_expansion_limit(n, m, sc)
