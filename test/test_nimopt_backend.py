@@ -2763,3 +2763,49 @@ def test_a_primary_energy_curve_reaches_the_optimum_linopy_reaches(label):
 @pytest.mark.parametrize("label", sorted(PRIMARY_CURVES))
 def test_a_primary_energy_curve_resolves_the_method_linopy_resolves(label):
     assert_same_method(PRIMARY_CURVES[label])
+
+
+# --- the boundary with nimopt -----------------------------------------------
+
+
+def backend_modules():
+    """Every module of the backend, as a parsed tree beside its name."""
+    import ast
+    from pathlib import Path
+
+    import pypsa.optimization.nimopt_backend as backend
+
+    root = Path(backend.__file__).parent
+    return [(p.name, ast.parse(p.read_text())) for p in sorted(root.glob("*.py"))]
+
+
+def test_the_backend_reads_nimopt_through_its_public_names():
+    import ast
+
+    offenders = []
+    for name, tree in backend_modules():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".")[0]
+                    if top == "nimblend" or alias.name.startswith("nimopt."):
+                        offenders.append(f"{name}: import {alias.name}")
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                if node.module.split(".")[0] == "nimblend":
+                    offenders.append(f"{name}: from {node.module}")
+                elif node.module.startswith("nimopt."):
+                    offenders.append(f"{name}: from {node.module}")
+                elif node.module == "nimopt":
+                    offenders.extend(
+                        f"{name}: {a.name}"
+                        for a in node.names
+                        if a.name not in no.__all__
+                    )
+            elif (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "no"
+                and node.attr not in no.__all__
+            ):
+                offenders.append(f"{name}: no.{node.attr}")
+    assert offenders == [], offenders
