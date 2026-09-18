@@ -2615,3 +2615,99 @@ def test_a_capital_cost_curve_with_an_overnight_cost_raises():
     )
     with pytest.raises(ValueError, match=re.escape(message)):
         n.optimize.create_model(backend="nimopt", include_objective_constant=False)
+
+
+# --- piecewise attributes: efficiency at a port ------------------------------
+
+
+def port_curve(component, attr, curve, delayed=False):
+    """A link or process whose output at bus1 follows an efficiency curve."""
+    n = pypsa.Network()
+    n.set_snapshots(range(3))
+    n.add("Bus", ["bus0", "bus1"])
+    n.add("Carrier", "gas")
+    n.add("Generator", "gen0", carrier="gas", bus="bus0", p_nom=150, marginal_cost=1)
+    n.add("Load", "load", bus="bus1", p_set=[20, 30, 40])
+    common = {"carrier": "gas", "bus0": "bus0", "bus1": "bus1", "p_nom": 100}
+    n.add(
+        component,
+        "curved",
+        marginal_cost=20,
+        **{attr: curve},
+        **({"delay1": 1} if delayed else {}),
+        **common,
+    )
+    if delayed:
+        n.add(component, "plain", marginal_cost=30, **{attr: 0.5}, **common)
+    return n, {}
+
+
+def two_port_curve(component):
+    """A link or process with a fixed rate at bus1 and a curve at bus2."""
+    n = pypsa.Network()
+    n.set_snapshots(range(3))
+    n.add("Bus", ["bus0", "bus1", "bus2"])
+    n.add("Carrier", "gas")
+    n.add("Generator", "gen0", carrier="gas", bus="bus0", p_nom=100, marginal_cost=1)
+    n.add("Load", "load1", bus="bus1", p_set=[25, 31.25, 37.5])
+    n.add("Load", "load2", bus="bus2", p_set=[20, 30, 40])
+    first, second = ("efficiency", "efficiency2")
+    if component == "Process":
+        first, second = ("rate1", "rate2")
+    n.add(
+        component,
+        "curved",
+        carrier="gas",
+        bus0="bus0",
+        bus1="bus1",
+        bus2="bus2",
+        p_nom=100,
+        marginal_cost=20,
+        **{first: 0.5, second: {0.0: 0.0, 0.1: 0.3, 0.5: 0.4, 1.0: 0.6}},
+    )
+    return n, {}
+
+
+def committed_links():
+    """A committable and a non-committable link on a curve linopy formulates by SOS2."""
+    n = pypsa.Network()
+    n.set_snapshots(range(3))
+    n.add("Bus", ["bus0", "bus1"])
+    n.add("Carrier", "gas")
+    n.add("Generator", "gen0", carrier="gas", bus="bus0", p_nom=150)
+    n.add("Load", "load", bus="bus1", p_set=[20, 30, 40])
+    common = {
+        "carrier": "gas",
+        "bus0": "bus0",
+        "bus1": "bus1",
+        "p_nom": 100,
+        "marginal_cost": 20,
+    }
+    curve = {0.0: 0.0, 0.1: 0.3, 0.5: 0.2, 1.0: 0.1}
+    n.add("Link", "plain", efficiency=0.5, **common)
+    n.add("Link", "free", efficiency=curve, p_min_pu=0.1, **common)
+    n.add(
+        "Link", "committed", efficiency=curve, committable=True, p_min_pu=0.1, **common
+    )
+    return n, {}
+
+
+RISING = {0.0: 0.0, 0.5: 0.5, 1.0: 0.75}
+PORT_CURVES = {
+    "link efficiency": lambda: port_curve("Link", "efficiency", RISING),
+    "process rate1": lambda: port_curve("Process", "rate1", RISING),
+    "delayed process": lambda: port_curve("Process", "rate1", RISING, delayed=True),
+    "link efficiency2": lambda: two_port_curve("Link"),
+    "process rate2": lambda: two_port_curve("Process"),
+    "committed links, sos2 in linopy": committed_links,
+}
+
+
+@pytest.mark.parametrize("label", sorted(PORT_CURVES))
+def test_a_port_curve_reaches_the_optimum_linopy_reaches(label):
+    assert_same_as_linopy(PORT_CURVES[label])
+
+
+@pytest.mark.parametrize("label", sorted(PORT_CURVES))
+def test_a_port_curve_resolves_the_method_linopy_resolves(label):
+    assert_same_method(PORT_CURVES[label])

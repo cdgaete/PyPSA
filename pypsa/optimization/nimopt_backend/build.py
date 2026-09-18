@@ -132,7 +132,7 @@ def _refuse_unsupported(
                 continue
             if n.has_scenarios:
                 reasons.append(f"piecewise {c.name} {attr} under scenarios")
-            elif attr not in ("marginal_cost", "capital_cost"):
+            elif c.name == "Generator" and attr == "efficiency":
                 reasons.append(f"piecewise {c.name} {attr}")
         if c.name not in {name for name, _ in RAMPING}:
             for col in ("ramp_limit_up", "ramp_limit_down"):
@@ -1693,6 +1693,8 @@ def define_nodal_balance_constraints(
     *,
     sc: Scenarios,
     pe: Periods,
+    piecewise_options: Any = (),
+    linearized: bool = False,
 ) -> None:
     """Power balance at every bus and snapshot, grouped by bus connectivity.
 
@@ -1758,27 +1760,66 @@ def define_nodal_balance_constraints(
             if not reaches.any():
                 continue
             attached.update(at_bus[reaches])
+            coefficient_attr = c._port_coefficient_attr(port)
             grid = np.asarray(
-                sc.grid(c, c._port_coefficient_attr(port), sns, names).to_numpy(),
+                sc.grid(c, coefficient_attr, sns, names).to_numpy(),
                 dtype=np.float64,
             )
+            curved = pd.Index([], name="name")
+            if not c._piecewise_schema(coefficient_attr).empty:
+                curved = declare_piecewise(
+                    n,
+                    m,
+                    c,
+                    attr=coefficient_attr,
+                    names=names,
+                    sign="=",
+                    cumulative=False,
+                    status=True,
+                    options=_options_for(piecewise_options, c, coefficient_attr),
+                    linearized=linearized,
+                    sns=sns,
+                    sc=sc,
+                    pe=pe,
+                )
+            on_curve = np.isin(_names(names), _names(curved))
             for tag, keep, arrival in _delay_groups(
                 delays, c._port_suffix(port), names, reaches, T
             ):
+                linear = keep & ~on_curve
                 terms.extend(
                     _arrivals(
                         (B, K, T),
                         f"{c_name}-p-{column}{tag}",
                         sc,
                         pe,
-                        efficiency=grid[:, keep] if sc else grid[keep],
-                        member=_names(names)[keep],
-                        reaching=at_bus[keep],
+                        efficiency=grid[:, linear] if sc else grid[linear],
+                        member=_names(names)[linear],
+                        reaching=at_bus[linear],
                         snapshots=sns,
                         flow=flow,
                         arrival=arrival,
                     )
                 )
+                curve = keep & on_curve
+                if curve.any():
+                    aux = c._piecewise_aux_var(coefficient_attr)
+                    coefficient = _incidence(
+                        f"{aux}-{column}{tag}",
+                        B,
+                        K,
+                        at_bus=at_bus[curve],
+                        names=_names(names)[curve],
+                        values=np.ones(int(curve.sum())),
+                        sc=sc,
+                    )
+                    terms.append(
+                        Sum(
+                            K,
+                            coefficient[*sc.sets, B, K]
+                            * m.var(aux)[*sc.sets, K, *pe.sets, arrival],
+                        )
+                    )
 
     balance = terms[0]
     for term in terms[1:]:
@@ -3373,7 +3414,15 @@ def create_model(
     define_ramp_limit_constraints(n, m, sns, sc, pe)
     define_fixed_operation_constraints(n, m, sns, sc, pe)
     define_nodal_balance_constraints(
-        n, m, sns, meshed_thresholds, bool(segments), sc=sc, pe=pe
+        n,
+        m,
+        sns,
+        meshed_thresholds,
+        bool(segments),
+        sc=sc,
+        pe=pe,
+        piecewise_options=options,
+        linearized=linearized,
     )
     if segments:
         define_loss_constraints(n, m, sns, segments, sc=sc, pe=pe)
