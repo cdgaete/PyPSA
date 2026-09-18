@@ -23,6 +23,7 @@ from pypsa.optimization.piecewise import PiecewiseOptions
 
 no = pytest.importorskip("nimopt")
 
+from pypsa.optimization.nimopt_backend.model import _symbol  # noqa: E402
 from pypsa.optimization.nimopt_backend.piecewise import (  # noqa: E402
     breakpoint_param,
     option_groups,
@@ -2204,3 +2205,338 @@ def test_a_breakpoint_parameter_has_a_value_at_each_valid_breakpoint():
     held = breakpoint_param("curve-x_points", (N, B), x, x.notnull())
     assert held.name == "curve_x_points"
     assert held.materialise().values().tolist() == [0.0, 50.0, 100.0, 0.0, 100.0]
+
+
+# --- piecewise attributes: the same optimum as linopy ------------------------
+
+LINOPY_METHOD = {"lp": "tangent", "incremental": "incremental", "sos2": "incremental"}
+RESULT_FRAMES = ("p", "p0", "p1", "p2", "p_dispatch", "p_store")
+
+
+def piecewise_results(n):
+    """The dispatch, the capacities and every piecewise result PyPSA assigns.
+
+    A piecewise result per snapshot is the curve divided by the dispatch, and
+    is compared where the dispatch is not zero.
+    """
+    held = {}
+    for c in n.components:
+        if c.static.empty:
+            continue
+        for key, frame in c.dynamic.items():
+            if frame.empty:
+                continue
+            if key in RESULT_FRAMES:
+                held[f"{c.name}.{key}"] = frame.to_numpy(dtype=float)
+            elif key.endswith("_piecewise_opt"):
+                dispatch = c.dynamic["p_dispatch" if c.name == "StorageUnit" else "p"]
+                running = dispatch.reindex_like(frame).abs() > 1e-6
+                held[f"{c.name}.{key}"] = frame.where(running).to_numpy(dtype=float)
+        for column in c.static.columns:
+            if column.endswith(("_piecewise_opt", "_nom_opt")):
+                held[f"{c.name}.{column}"] = c.static[column].to_numpy(dtype=float)
+    return held
+
+
+def assert_same_as_linopy(build):
+    """Solve `build()` on both backends; the objective and the results agree."""
+    a, kwargs = build()
+    b, _ = build()
+    a.optimize(solver_name=SOLVER, reformulate_sos=True, **kwargs)
+    b.optimize(solver_name=SOLVER, backend="nimopt", **kwargs)
+    assert b.objective == pytest.approx(a.objective, rel=1e-6)
+    left, right = piecewise_results(a), piecewise_results(b)
+    assert sorted(right) == sorted(left)
+    for key, values in left.items():
+        np.testing.assert_allclose(
+            right[key], values, rtol=1e-6, atol=1e-6, err_msg=key
+        )
+
+
+def assert_same_method(build):
+    """Each PyPSA call resolves to linopy's method, mapped to nimopt's."""
+    a, kwargs = build()
+    b, _ = build()
+    linopy = a.optimize.create_model(**kwargs)
+    nimopt = b.optimize.create_model(backend="nimopt", **kwargs).model
+    stems = [name for name in linopy.variables if name.endswith("_piecewise")]
+    assert stems
+    for stem in stems:
+        expected = {
+            LINOPY_METHOD[formulation.method]
+            for name, formulation in linopy._piecewise_formulations.items()
+            if name == stem or name.startswith(f"{stem}_")
+        }
+        symbol = _symbol(stem)
+        found = {
+            declaration.method
+            for name, declaration in nimopt.piecewise_declarations.items()
+            if name == symbol or name.startswith(f"{symbol}_")
+        }
+        assert found == expected, stem
+
+
+def cost_curve(curve, **generator):
+    """A generator with a cost curve beside one at a fixed marginal cost."""
+    n = pypsa.Network()
+    n.add("Bus", "bus0")
+    n.add("Generator", "gen0", bus="bus0", p_nom=100, marginal_cost=50)
+    n.add("Generator", "gen1", bus="bus0", p_nom=100, marginal_cost=curve, **generator)
+    n.add("Load", "load", bus="bus0", p_set=80)
+    return n, {}
+
+
+def ragged_costs():
+    """Two generators whose curves have three and two breakpoints."""
+    nan = float("nan")
+    segments = pd.DataFrame(
+        [[0.0, 10.0, 0.0, 5.0], [0.5, 20.0, 1.0, 25.0], [1.0, 40.0, nan, nan]],
+        columns=pd.MultiIndex.from_tuples(
+            [
+                ("gen0", "p_pu"),
+                ("gen0", "marginal_cost"),
+                ("gen1", "p_pu"),
+                ("gen1", "marginal_cost"),
+            ],
+            names=["name", "attribute"],
+        ),
+    )
+    n = pypsa.Network()
+    n.add("Bus", "bus0")
+    n.add("Generator", ["gen0", "gen1"], bus="bus0", p_nom=100, marginal_cost=segments)
+    n.add("Load", "load", bus="bus0", p_set=80)
+    return n, {}
+
+
+def storage_costs(kind):
+    """A storage unit or a store whose dispatch has a cost curve."""
+    n = pypsa.Network()
+    n.set_snapshots(range(2))
+    n.add("Bus", "bus0")
+    n.add("Generator", "gen0", bus="bus0", p_nom=100, marginal_cost=50)
+    curve = {0.0: 0.0, 0.5: 3.0, 1.0: 10.0}
+    if kind == "StorageUnit":
+        n.add(
+            "StorageUnit",
+            "su0",
+            bus="bus0",
+            p_nom=100,
+            max_hours=1,
+            state_of_charge_initial=75,
+            marginal_cost=curve,
+        )
+    else:
+        n.add(
+            "Store", "store0", bus="bus0", e_nom=100, e_initial=75, marginal_cost=curve
+        )
+    n.add("Load", "load", bus="bus0", p_set=50)
+    return n, {}
+
+
+def committed_costs(linearized=False):
+    """A committable and a non-committable generator, each with a cost curve."""
+    n = pypsa.Network()
+    n.set_snapshots(range(2))
+    n.add("Bus", "bus0")
+    n.add("Load", "load", bus="bus0", p_set=[80, 150])
+    n.add("Generator", "gen0", bus="bus0", p_nom=100, marginal_cost=50)
+    n.add(
+        "Generator",
+        "gen1",
+        bus="bus0",
+        p_nom=100,
+        marginal_cost={0.0: 60.0, 0.1: 60.0, 0.5: 35.0, 1.0: 100.0},
+    )
+    n.add(
+        "Generator",
+        "gen-committable",
+        bus="bus0",
+        p_nom=100,
+        marginal_cost={0.0: 60, 0.5: 75, 1.0: 100.0},
+        committable=True,
+        stand_by_cost=5,
+    )
+    return n, {"linearized_unit_commitment": True} if linearized else {}
+
+
+def optioned_costs(named):
+    """Cost curves under one option: without names, or naming one generator."""
+    n = pypsa.Network()
+    n.add("Bus", "bus0")
+    n.add("Generator", "gen0", bus="bus0", p_nom=100, marginal_cost=50)
+    n.add(
+        "Generator",
+        "gen1",
+        bus="bus0",
+        p_nom=100,
+        marginal_cost={0.0: 0.0, 0.5: 1.0, 1.0: 4.0},
+    )
+    if named:
+        n.add(
+            "Generator",
+            "gen2",
+            bus="bus0",
+            p_nom=100,
+            marginal_cost={0.0: 0.0, 0.5: 20.0, 1.0: 30.0},
+        )
+        option = PiecewiseOptions(
+            "Generator", "marginal_cost", ">=", name="gen2", method="incremental"
+        )
+    else:
+        option = PiecewiseOptions("Generator", "marginal_cost", ">=", method="lp")
+    n.add("Load", "load", bus="bus0", p_set=150)
+    return n, {"piecewise_options": [option]}
+
+
+def modules_beside_a_curve():
+    """A modular committable, with a status that counts modules, beside a curve."""
+    n = pypsa.Network()
+    n.set_snapshots(range(2))
+    n.add("Bus", "bus0")
+    n.add("Load", "load", bus="bus0", p_set=[80, 150])
+    n.add("Generator", "gen0", bus="bus0", p_nom=100, marginal_cost=50)
+    n.add(
+        "Generator",
+        "gen-committable",
+        bus="bus0",
+        p_nom=100,
+        marginal_cost={0.0: 60, 0.5: 75, 1.0: 100.0},
+        committable=True,
+        stand_by_cost=5,
+    )
+    n.add(
+        "Generator",
+        "modules",
+        bus="bus0",
+        p_nom_extendable=True,
+        p_nom_mod=10,
+        p_nom_max=50,
+        committable=True,
+        capital_cost=1,
+        marginal_cost=40,
+    )
+    return n, {}
+
+
+COST_CURVES = {
+    "convex": lambda: cost_curve({0.0: 0.0, 0.5: 1.0, 1.0: 4.0}),
+    "not convex": lambda: cost_curve({0.0: 0.0, 0.1: 60.0, 0.5: 35.0, 1.0: 100.0}),
+    "ragged": ragged_costs,
+    "storage unit": lambda: storage_costs("StorageUnit"),
+    "store": lambda: storage_costs("Store"),
+    "committable and not": committed_costs,
+    "committable, linearized": lambda: committed_costs(linearized=True),
+    "an option without names": lambda: optioned_costs(named=False),
+    "a named option": lambda: optioned_costs(named=True),
+    "a modular committable beside a curve": modules_beside_a_curve,
+}
+
+
+@pytest.mark.parametrize("label", sorted(COST_CURVES))
+def test_a_cost_curve_reaches_the_optimum_linopy_reaches(label):
+    assert_same_as_linopy(COST_CURVES[label])
+
+
+@pytest.mark.parametrize("label", sorted(COST_CURVES))
+def test_a_cost_curve_resolves_the_method_linopy_resolves(label):
+    assert_same_method(COST_CURVES[label])
+
+
+def test_a_convex_cost_curve_prices_the_bus_as_linopy_does():
+    a, _ = COST_CURVES["convex"]()
+    b, _ = COST_CURVES["convex"]()
+    a.optimize(solver_name=SOLVER)
+    b.optimize(solver_name=SOLVER, backend="nimopt")
+    np.testing.assert_allclose(
+        b.c["Bus"].dynamic["marginal_price"].to_numpy(),
+        a.c["Bus"].dynamic["marginal_price"].to_numpy(),
+    )
+
+
+def test_a_model_with_cost_curves_reads_back_from_its_file(tmp_path):
+    n, kwargs = COST_CURVES["committable and not"]()
+    model = n.optimize.create_model(backend="nimopt", **kwargs).model
+    no.save(model, tmp_path / "curves.yaml")
+    assert "where:" in (tmp_path / "curves.yaml").read_text()
+    back = no.load(tmp_path / "curves.yaml")
+    assert back.solve(SOLVER).objective == pytest.approx(model.solve(SOLVER).objective)
+
+
+def test_a_curve_under_method_sos2_is_not_supported():
+    n, _ = COST_CURVES["convex"]()
+    option = PiecewiseOptions("Generator", "marginal_cost", ">=", method="sos2")
+    message = (
+        "method 'sos2' of piecewise 'marginal_cost' of Generator is not "
+        "supported by the nimopt backend"
+    )
+    with pytest.raises(NotImplementedError, match=re.escape(message)):
+        n.optimize.create_model(backend="nimopt", piecewise_options=[option])
+
+
+def test_a_curve_with_a_repeated_x_breakpoint_is_not_supported():
+    # linopy resolves sos2 for this curve
+    n, _ = cost_curve(
+        pd.DataFrame(
+            {"p_pu": [0.0, 0.5, 0.5, 1.0], "marginal_cost": [0.0, 1.0, 2.0, 3.0]}
+        )
+    )
+    message = (
+        "piecewise 'marginal_cost' of Generator has x breakpoints that are not "
+        "strictly monotonic"
+    )
+    with pytest.raises(NotImplementedError, match=re.escape(message)):
+        n.optimize.create_model(backend="nimopt")
+
+
+def test_a_curve_on_a_network_with_scenarios_is_not_supported(monkeypatch):
+    # PyPSA rejects a curve and scenarios together; the backend checks as well
+    n, _ = COST_CURVES["convex"]()
+    monkeypatch.setattr(pypsa.Network, "has_scenarios", property(lambda self: True))
+    with pytest.raises(NotImplementedError, match="piecewise Generator marginal_cost"):
+        n.optimize.create_model(backend="nimopt", consistency_check=False)
+
+
+def cost_over_periods(curve):
+    """Cost curves of constant slope over two weighted periods, or their linear costs."""
+    n = pypsa.Network(snapshots=range(2))
+    n.investment_periods = [2020, 2030]
+    n.investment_period_weightings["objective"] = [1.0, 0.7]
+    n.add("Bus", "bus0")
+    n.add(
+        "Generator",
+        "gen0",
+        bus="bus0",
+        p_nom=100,
+        marginal_cost=50,
+        build_year=2020,
+        lifetime=30,
+    )
+    for name, size, cost, built in (
+        ("early", 40, 20.0, 2020),
+        ("late", 60, 10.0, 2030),
+    ):
+        n.add(
+            "Generator",
+            name,
+            bus="bus0",
+            p_nom=size,
+            marginal_cost={0.0: cost, 1.0: cost} if curve else cost,
+            build_year=built,
+            lifetime=30,
+        )
+    n.add("Load", "load", bus="bus0", p_set=[80, 90, 80, 90])
+    return n
+
+
+def test_a_cost_curve_over_investment_periods_prices_as_its_linear_cost():
+    # linopy builds no operational curve over investment periods; a curve of
+    # constant slope prices each period as the linear cost does: 7640
+    linear, curved = cost_over_periods(curve=False), cost_over_periods(curve=True)
+    linear.optimize(solver_name=SOLVER, multi_investment_periods=True)
+    curved.optimize(solver_name=SOLVER, backend="nimopt", multi_investment_periods=True)
+    assert curved.objective == pytest.approx(linear.objective, rel=1e-9)
+    np.testing.assert_allclose(
+        curved.c["Generator"].dynamic["p"].to_numpy(),
+        linear.c["Generator"].dynamic["p"].to_numpy(),
+        atol=1e-9,
+    )

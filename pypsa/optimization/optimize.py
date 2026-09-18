@@ -813,6 +813,7 @@ class OptimizationAccessor(OptimizationAbstractMixin):
                 linearized_unit_commitment=linearized_unit_commitment,
                 include_objective_constant=include_objective_constant,
                 meshed_thresholds=meshed_thresholds,
+                piecewise_options=piecewise_opts,
                 **kwargs,
             )
         if backend != "linopy":

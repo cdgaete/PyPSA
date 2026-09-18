@@ -18,7 +18,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pandas as pd
 import xarray as xr
-from nimopt import Param, Sum, subset
+from linopy.constants import BREAKPOINT_DIM
+from nimopt import Param, Set, Sum, subset
 
 from pypsa.common import as_index
 from pypsa.constants import PYPSA_DATA_DIR
@@ -27,12 +28,19 @@ from pypsa.optimization.common import get_bus_counts
 from pypsa.optimization.constraints import _get_delay_config
 from pypsa.optimization.nimopt_backend.model import NimoptModel, _symbol
 from pypsa.optimization.nimopt_backend.periods import Periods
+from pypsa.optimization.nimopt_backend.piecewise import (
+    SIGNS,
+    breakpoint_param,
+    option_groups,
+    resolve_method,
+)
 from pypsa.optimization.nimopt_backend.scenarios import (
     Scenarios,
     columns_of,
     readable,
     time_coords,
 )
+from pypsa.optimization.piecewise import _get_breakpoints, get_piecewise_names
 from pypsa.optimization.window import SnapshotWindow
 
 if TYPE_CHECKING:
@@ -120,7 +128,11 @@ def _refuse_unsupported(
         if not c.maintainables.empty:
             reasons.append(f"maintainable {c.name} components")
         for attr, frame in c.piecewise.items():
-            if frame is not None and not frame.empty:
+            if frame is None or frame.empty:
+                continue
+            if n.has_scenarios:
+                reasons.append(f"piecewise {c.name} {attr} under scenarios")
+            elif attr != "marginal_cost":
                 reasons.append(f"piecewise {c.name} {attr}")
         if c.name not in {name for name, _ in RAMPING}:
             for col in ("ramp_limit_up", "ramp_limit_down"):
@@ -3005,6 +3017,92 @@ def define_cvar_constraints(
     return tail
 
 
+def _options_for(options: Any, c: Any, attr: str) -> list:
+    """Return the piecewise options for one component class and attribute."""
+    return [o for o in options if o.component == c.name and o.attribute == attr]
+
+
+def declare_piecewise(
+    n: Network,
+    m: NimoptModel,
+    c: Any,
+    *,
+    attr: str,
+    names: pd.Index,
+    sign: str,
+    cumulative: bool,
+    invert: bool = False,
+    status: bool = False,
+    timed: bool = True,
+    options: Any = (),
+    linearized: bool = False,
+    sns: pd.Index,
+    sc: Scenarios,
+    pe: Periods,
+) -> pd.Index:
+    """Declare the piecewise curves of one PyPSA call and return the names with a curve.
+
+    The auxiliary variable takes PyPSA's name for `attr`, and `assign_solution`
+    reads it. Each option group declares one `Model.piecewise` over the names
+    without a status, and one over the names with a status that passes the
+    status as `active`. A `where` parameter restricts each declaration to its
+    names. `timed` declares the curves over the snapshots, and otherwise over
+    the components only.
+    """
+    curved = get_piecewise_names(c, attr, names)
+    if curved.empty:
+        return curved
+    x_points, y_points, valid = _get_breakpoints(c, attr, curved, cumulative, invert)
+    aux = c._piecewise_aux_var(attr)
+    N = m.sets[c.name]
+    B = Set(_symbol(f"{aux}-breakpoint"), np.asarray(x_points.indexes[BREAKPOINT_DIM]))
+    xp = breakpoint_param(f"{aux}-x_points", (N, B), x_points, valid)
+    yp = breakpoint_param(f"{aux}-y_points", (N, B), y_points, valid)
+    if timed:
+        frame = sc.sets + (N, *pe.sets, m.sets["snapshot"])
+        members = _domain_of(f"{aux}-subset", frame, _active(c, sns, curved, sc))
+    else:
+        frame = (N,)
+        members = _named_domain(f"{aux}-subset", frame, {N.name: _names(curved)})
+    m.add_variables(aux, frame, subset=members, members={"name": curved}, **FREE)
+    x = m.var(c._piecewise_x_var(attr))[*frame]
+    y = m.var(aux)[*frame]
+    committed = pd.Index([], name="name")
+    if status and c.name in {name for name, _ in COMMITTABLE}:
+        committed = _committable(n, c.name)[1]
+    owner = f"piecewise {attr!r} of {c.name}"
+    for suffix, covered, requested, held in option_groups(curved, options, sign):
+        with_status = covered.intersection(committed)
+        method = resolve_method(
+            requested,
+            SIGNS[held],
+            has_status=not with_status.empty,
+            x_points=x_points.sel(name=covered),
+            y_points=y_points.sel(name=covered),
+            owner=owner,
+        )
+        for part, tag in (
+            (covered.difference(with_status), ""),
+            (with_status, "-status"),
+        ):
+            if part.empty:
+                continue
+            name = f"{aux}{suffix}{tag}"
+            m.model.piecewise(
+                _symbol(name),
+                x,
+                xp[N, B],
+                y,
+                yp[N, B],
+                SIGNS[held],
+                method,
+                active=m.var(f"{c.name}-status")[*frame] if tag else None,
+                relaxed=bool(linearized) if tag else False,
+                where=_named_domain(f"{name}-where", (N,), {N.name: _names(part)}),
+            )
+    return curved
+
+
 def define_objective(
     n: Network,
     m: NimoptModel,
@@ -3013,6 +3111,8 @@ def define_objective(
     *,
     sc: Scenarios,
     pe: Periods,
+    piecewise_options: Any = (),
+    linearized: bool = False,
 ) -> None:
     """Capital cost of capacity built and operating cost of energy run.
 
@@ -3068,6 +3168,41 @@ def define_objective(
             if c.static.empty or variable not in m.variables:
                 continue
             names = c.active_assets
+            if c.has_piecewise(cost_type):
+                curved = declare_piecewise(
+                    n,
+                    m,
+                    c,
+                    attr=cost_type,
+                    names=names,
+                    sign=">=",
+                    cumulative=True,
+                    status=True,
+                    options=_options_for(piecewise_options, c, cost_type),
+                    linearized=linearized,
+                    sns=sns,
+                    sc=sc,
+                    pe=pe,
+                )
+                if not curved.empty:
+                    aux = c._piecewise_aux_var(cost_type)
+                    N = m.sets[c_name]
+                    grid = sc.over(
+                        sc.ones(_names(curved), sns) * weight, ("name", "snapshot")
+                    )
+                    price = _sparse_of(
+                        f"{aux}-weight", sc.sets + (N, *pe.sets, T), grid
+                    )
+                    operating.append(
+                        Sum(
+                            N,
+                            *pe.sets,
+                            T,
+                            price[*sc.sets, N, *pe.sets, T]
+                            * m.var(aux)[*sc.sets, N, *pe.sets, T],
+                        )
+                    )
+                    names = names.difference(curved)
             cost = sc.over(
                 sc.grid(c, cost_type, sns, names) * weight, ("name", "snapshot")
             )
@@ -3158,6 +3293,7 @@ def create_model(
     linearized_unit_commitment: bool = False,
     include_objective_constant: bool = True,
     meshed_thresholds: Any = None,
+    piecewise_options: Any = None,
     **kwargs: Any,
 ) -> NimoptModel:
     """Build the network's optimisation problem as a nimopt model, stored at `n.model`."""
@@ -3171,6 +3307,8 @@ def create_model(
     m = NimoptModel("pypsa")
     n._model = m
     sc = Scenarios.of(n)
+    options = list(piecewise_options or [])
+    linearized = bool(linearized_unit_commitment)
 
     define_sets(n, m, sc, pe)
     segments = _tangent_segments(transmission_losses)
@@ -3205,5 +3343,14 @@ def create_model(
     define_tech_capacity_expansion_limit(n, m, sc)
     define_transmission_expansion_limit(n, m, sc)
     define_growth_limit(n, m, sns, sc, pe)
-    define_objective(n, m, sns, include_objective_constant, sc=sc, pe=pe)
+    define_objective(
+        n,
+        m,
+        sns,
+        include_objective_constant,
+        sc=sc,
+        pe=pe,
+        piecewise_options=options,
+        linearized=linearized,
+    )
     return m
