@@ -31,7 +31,7 @@ from pypsa.optimization.nimopt_backend.piecewise import (  # noqa: E402
 )
 from pypsa.optimization.nimopt_backend.scenarios import (  # noqa: E402
     Scenarios,
-    columns_of,
+    axes_of,
     labels_of,
 )
 
@@ -1502,7 +1502,7 @@ def test_an_empty_axis_refuses_an_array_carrying_scenarios(ac_dc_stochastic):
         Scenarios.empty().static(c, "p_nom_min", c.active_assets)
 
 
-def test_columns_are_derived_from_the_array_and_not_from_a_position():
+def test_axes_are_derived_from_the_array_and_not_from_a_position():
     # An array whose axes are ordered against the canonical order still labels
     # every entry correctly, because each axis is named by the array itself.
     da = xr.DataArray(
@@ -1510,12 +1510,32 @@ def test_columns_are_derived_from_the_array_and_not_from_a_position():
         coords={"snapshot": [0, 1, 2], "name": ["a", "b"]},
         dims=("snapshot", "name"),
     )
-    columns, values = columns_of(da, np.ones(da.shape, dtype=bool))
-    assert set(columns) == {"snapshot", "name"}
-    order = np.lexsort((columns["name"], columns["snapshot"]))
+    axes, values = axes_of(da, np.ones(da.shape, dtype=bool))
+    assert set(axes) == {"snapshot", "name"}
+    names = axes["name"][0][axes["name"][1]]
+    snapshots = axes["snapshot"][0][axes["snapshot"][1]]
+    order = np.lexsort((names, snapshots))
     assert list(values[order]) == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
-    assert list(columns["name"][order]) == ["a", "b", "a", "b", "a", "b"]
-    assert list(columns["snapshot"][order]) == [0, 0, 1, 1, 2, 2]
+    assert list(names[order]) == ["a", "b", "a", "b", "a", "b"]
+    assert list(snapshots[order]) == [0, 0, 1, 1, 2, 2]
+
+
+def test_a_multi_period_axis_is_read_level_by_level():
+    # a snapshot indexed by (period, timestep) states one axis per level, and
+    # each marked cell stands at the codes of its own pair
+    sns = pd.MultiIndex.from_product(
+        [[2030, 2040], [0, 1]], names=["period", "timestep"]
+    )
+    da = xr.DataArray(
+        np.arange(4.0),
+        coords=xr.Coordinates.from_pandas_multiindex(sns, "snapshot"),
+        dims=("snapshot",),
+    )
+    axes, values = axes_of(da, np.array([False, True, True, False]))
+    assert set(axes) == {"period", "timestep"}
+    assert list(axes["period"][0][axes["period"][1]]) == [2030, 2040]
+    assert list(axes["timestep"][0][axes["timestep"][1]]) == [1, 0]
+    assert list(values) == [1.0, 2.0]
 
 
 def test_object_labels_are_read_as_strings():

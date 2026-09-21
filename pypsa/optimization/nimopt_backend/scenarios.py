@@ -28,26 +28,26 @@ def labels_of(da: xr.DataArray, dim: str) -> np.ndarray:
     return readable(da.indexes[dim].to_numpy())
 
 
-def columns_of(da: xr.DataArray, mask: np.ndarray) -> tuple[dict, np.ndarray]:
-    """One label column per dimension and one value column, for the cells `mask` marks.
+def axes_of(da: xr.DataArray, mask: np.ndarray) -> tuple[dict, np.ndarray]:
+    """One axis per dimension and one value column, for the cells `mask` marks.
 
-    Each axis is named by the array that holds it, so an array ordered against
-    the canonical order labels every entry correctly and nothing transposes. A
+    An axis is the labels of a dimension and the position of each marked cell
+    along it, so a label is read once however many cells stand at it. A
     dimension indexed by pairs -- the snapshots of a multi-period horizon --
-    states one column per level, under the level's own name.
+    states one axis per level, under the level's own name.
     """
     at = np.nonzero(np.asarray(mask))
-    columns = {}
+    axes = {}
     for k, dim in enumerate(da.dims):
         index = da.indexes[dim]
         if isinstance(index, pd.MultiIndex):
-            for level in index.names:
-                held = readable(index.get_level_values(level).to_numpy())
-                columns[level] = held[at[k]]
+            for level, name in enumerate(index.names):
+                labels = readable(index.levels[level].to_numpy())
+                axes[name] = (labels, np.asarray(index.codes[level])[at[k]])
             continue
-        columns[dim] = readable(index.to_numpy())[at[k]]
+        axes[dim] = (readable(index.to_numpy()), at[k])
     values = np.asarray(da.to_numpy(), dtype=np.float64)[at]
-    return columns, values
+    return axes, values
 
 
 def time_coords(sns: pd.Index) -> Any:

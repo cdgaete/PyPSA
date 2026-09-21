@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from linopy.constants import BREAKPOINT_DIM
-from nimopt import Param, Set, Sum, subset
+from nimopt import Param, Set, Sum, subset, subset_of
 
 from pypsa.common import as_index
 from pypsa.constants import PYPSA_DATA_DIR
@@ -35,7 +35,7 @@ from pypsa.optimization.nimopt_backend.piecewise import (
 )
 from pypsa.optimization.nimopt_backend.scenarios import (
     Scenarios,
-    columns_of,
+    axes_of,
     readable,
     time_coords,
 )
@@ -237,10 +237,27 @@ def _by_set(sets: tuple, columns: dict, dims_of: dict | None = None) -> dict:
     return held
 
 
+def _index_by_set(sets: tuple, axes: dict, dims_of: dict | None = None) -> np.ndarray:
+    """Return the position of each marked cell in each set, one row per set.
+
+    Each set reads the axis `_by_set` pairs it with. Only the labels a cell
+    stands at are looked up in the set, once each.
+    """
+    held = _by_set(sets, axes, dims_of)
+    rows = []
+    for s in sets:
+        labels, at = held[s.name]
+        used = np.flatnonzero(np.bincount(at, minlength=labels.size))
+        lookup = np.full(labels.size, -1, dtype=np.int64)
+        lookup[used] = s.position_of(labels[used])
+        rows.append(lookup[at])
+    return np.stack(rows)
+
+
 def _sparse_of(name: str, sets: tuple, da: xr.DataArray) -> Param:
     """Build a coefficient carrying the array's nonzeros; a zero is absent."""
-    columns, values = columns_of(da, np.asarray(da.to_numpy()) != 0)
-    return Param.from_long(_symbol(name), sets, _by_set(sets, columns), values)
+    axes, values = axes_of(da, np.asarray(da.to_numpy()) != 0)
+    return Param.from_positions(_symbol(name), sets, _index_by_set(sets, axes), values)
 
 
 def _long_of(
@@ -256,8 +273,9 @@ def _long_of(
     `DIM_OF_SET`.
     """
     mask = np.ones(da.shape, dtype=bool) if keep is None else np.asarray(keep)
-    columns, values = columns_of(da, mask)
-    return Param.from_long(_symbol(name), sets, _by_set(sets, columns, dims_of), values)
+    axes, values = axes_of(da, mask)
+    index = _index_by_set(sets, axes, dims_of)
+    return Param.from_positions(_symbol(name), sets, index, values)
 
 
 def breakpoint_param(
@@ -299,12 +317,17 @@ def _dense_of(name: str, sets: tuple, values: np.ndarray, pe: Periods) -> Param:
 
 def _domain_of(name: str, sets: tuple, da: xr.DataArray) -> Any:
     """Return the coordinates the array marks, as something a file can address."""
-    columns, _ = columns_of(da, np.asarray(da.to_numpy()).astype(bool))
-    return _named_domain(name, sets, _by_set(sets, columns))
+    axes, _ = axes_of(da, np.asarray(da.to_numpy()).astype(bool))
+    return _addressable(name, sets, subset_of(sets, _index_by_set(sets, axes)))
 
 
 def _named_domain(name: str, sets: tuple, columns: dict) -> Any:
-    """Return the coordinates `columns` names, as something a file can address.
+    """Return the coordinates `columns` names, as something a file can address."""
+    return _addressable(name, sets, subset(sets, columns))
+
+
+def _addressable(name: str, sets: tuple, held: Any) -> Any:
+    """Return the members of a domain, as something a file can address.
 
     A membership reaching every cell of the product is the sets themselves,
     which a file states as their names. One reaching fewer is a parameter
@@ -312,7 +335,6 @@ def _named_domain(name: str, sets: tuple, columns: dict) -> Any:
     beside the rest of the data. A domain states the same coordinates and
     carries no name, so a model holding one cannot be written.
     """
-    held = subset(sets, columns)
     if held.is_full:
         return sets
     return Param(_symbol(name), sets, held.array(np.ones(held.size)))
