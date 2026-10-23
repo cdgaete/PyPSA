@@ -69,6 +69,23 @@ def test_the_backend_reaches_the_objective_linopy_reaches(network, request):
     assert b.objective == pytest.approx(a.objective, rel=1e-9)
 
 
+def test_the_backend_takes_the_solvers_nimopt_adapts():
+    # the backend validates a solver name through nimopt; a list of its own
+    # would omit an adapter nimopt adds
+    with pytest.raises(ValueError, match="the solvers are"):
+        tiny().optimize(backend="nimopt", solver_name="glpk")
+
+
+@pytest.mark.skipif(
+    "gams" not in no.available(), reason="the gams adapter needs GAMS on PATH"
+)
+def test_the_gams_adapter_returns_the_objective_highs_returns(ac_dc_network):
+    highs = solved(ac_dc_network.copy(), "nimopt")
+    gams = ac_dc_network.copy()
+    gams.optimize(backend="nimopt", solver_name="gams")
+    assert gams.objective == pytest.approx(highs.objective, rel=1e-6)
+
+
 def test_the_dispatch_a_cost_prices_agrees_with_linopy(ac_dc_network):
     # a variable the objective prices is pinned by the optimum; one it does
     # not -- a store's energy level -- is free to differ between two optima

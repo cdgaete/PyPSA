@@ -31,8 +31,6 @@ STATUS: dict[str, tuple[str, str]] = {
     "empty": ("warning", "unknown"),
 }
 
-SOLVERS = ("highs", "gurobi", "mosek")
-
 
 def _symbol(name: str) -> str:
     """Return `name` as a name a nimopt expression can address.
@@ -406,9 +404,6 @@ class NimoptModel:
         self, solver_name: str = "highs", progress: bool = False, **kwargs: Any
     ) -> tuple[str, str]:
         """Solve through nimopt, answering linopy's `(status, condition)` pair."""
-        if solver_name not in SOLVERS:
-            msg = f"nimopt solves through {SOLVERS}; got {solver_name!r}."
-            raise ValueError(msg)
         options = _translate_options(solver_name, kwargs)
         self.solver_name = solver_name
         self.solution = self.model.solve(solver_name, options or None, progress)
