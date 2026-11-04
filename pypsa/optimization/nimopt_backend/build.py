@@ -104,15 +104,11 @@ PERIOD_UNSTATED = ()
 
 def _refuse_unsupported(
     n: Network,
-    sns: pd.Index,
     pe: Periods,
     transmission_losses: Any,
-    *,
-    linearized: bool = False,
 ) -> None:
     """Raise for every feature of the network the nimopt backend does not state."""
     reasons = []
-    reasons.extend(_unstated_history(n, sns, linearized=linearized))
     if pe and PERIOD_UNSTATED:
         reasons.append("under investment periods: " + ", ".join(PERIOD_UNSTATED))
     if n.has_scenarios and SCENARIO_UNSTATED:
@@ -170,68 +166,6 @@ def _refuse_unsupported(
     if reasons:
         msg = "The nimopt backend does not state: " + "; ".join(reasons) + "."
         raise NotImplementedError(msg)
-
-
-RAMP_LIMITS = (
-    "ramp_limit_up",
-    "ramp_limit_down",
-    "ramp_limit_start_up",
-    "ramp_limit_shut_down",
-)
-
-
-def _ramping(c: Any, names: pd.Index) -> pd.Index:
-    """Return the members of `names` with a ramp limit at any snapshot."""
-    held = np.zeros(len(names), dtype=bool)
-    for attr in RAMP_LIMITS:
-        if names.empty or attr not in c.static:
-            continue
-        limit = c.da[attr].sel(name=names).notnull()
-        held |= limit.any([d for d in limit.dims if d != "name"]).to_numpy()
-    return names[held]
-
-
-def _unstated_history(n: Network, sns: pd.Index, *, linearized: bool) -> list:
-    """Return the reasons a network needs the dispatch or status before the horizon.
-
-    PyPSA bounds the first snapshot by `p_init` where a component ramps, and
-    by the solved `status` and dispatch of the snapshot before a horizon that
-    starts after `n.snapshots[0]`. It ramps an extendable committable through
-    a big M. The backend declares none of these rows.
-    """
-    reasons = []
-    start = n.snapshots.get_loc(sns[0])
-    for c_name in ("Generator", "Link", "Process"):
-        c = n.c[c_name]
-        if c.static.empty:
-            continue
-        active = c.active_assets
-        committable = c.committables.intersection(active)
-        ramping = _ramping(c, active)
-        if not _ramping(c, committable.intersection(c.extendables)).empty:
-            reasons.append(f"ramp limits of extendable committable {c_name} components")
-        if "p_init" in c.static:
-            relaxed = committable if linearized else committable[:0]
-            reads = ramping.union(relaxed)
-            if np.isfinite(_per_component(c, "p_init", reads, np.float64)).any():
-                reasons.append(
-                    f"p_init of {c_name} components with a ramp limit or a "
-                    f"relaxed commitment"
-                )
-        if not start:
-            continue
-        if not committable.empty and not c.dynamic.status.empty:
-            reasons.append(
-                f"committable {c_name} components on a horizon starting after "
-                f"the first snapshot, with a solved status before it"
-            )
-        dispatch = "p0" if c_name in n.branch_components else "p"
-        if not ramping.empty and not c.dynamic[dispatch].empty:
-            reasons.append(
-                f"ramp limits of {c_name} components on a horizon starting after "
-                f"the first snapshot, with a solved dispatch before it"
-            )
-    return reasons
 
 
 def _departs(c: Any, attr: str, default: float) -> bool:
@@ -971,16 +905,6 @@ def define_commitment_variables(
             )
 
 
-def _flat_later(sns: pd.Index) -> pd.Index:
-    """Return the horizon's snapshots but its first.
-
-    A commitment's minimum times run on across a period boundary, so the one
-    row they cannot state is the horizon's own first snapshot rather than each
-    period's.
-    """
-    return sns[1:]
-
-
 def _before_period(da: xr.DataArray, pe: Periods, step: int) -> Any:
     """Mark the cells whose reference `step` snapshots back stands in an earlier period.
 
@@ -1033,6 +957,73 @@ def _lagged_terms(
                 across[*axes] * variable[*sc.sets, N, *pe.back(1), T.cyclic - step]
             )
     return terms
+
+
+def _window_start(n: Network, sns: pd.Index) -> int:
+    """Return the position of the horizon's first snapshot in `n.snapshots`."""
+    return int(n.snapshots.get_loc(sns[0]))
+
+
+def _status_history(
+    n: Network, c: Any, names: pd.Index, sns: pd.Index, length: int, *, sc: Scenarios
+) -> np.ndarray:
+    """Return the status at the `length` snapshots before the horizon.
+
+    The array is over the scenario axis, `name` and the lag, where lag 1 is
+    the snapshot right before the horizon. A solved `status` gives the
+    snapshots within `n.snapshots`, and `up_time_before` and
+    `down_time_before` give the ones before it. A component that is not
+    committable reads one.
+    """
+    start = _window_start(n, sns)
+    solved = min(start, length) if not c.dynamic.status.empty else 0
+    up = sc.over(c.da.up_time_before.sel(name=names), ("name",)).to_numpy()
+    down = sc.over(c.da.down_time_before.sel(name=names), ("name",)).to_numpy()
+    lags = np.arange(1, length - solved + 1)
+    parts = [
+        np.where(
+            down[..., None] > 0, lags > down[..., None], lags <= up[..., None]
+        ).astype(np.float64)
+    ]
+    if solved:
+        held = c.da.status.sel(name=names).isel(snapshot=slice(start - solved, start))
+        parts.insert(0, sc.over(held, ("name", "snapshot")).to_numpy()[..., ::-1])
+    history = np.concatenate(parts, axis=-1)
+    committable = sc.over(c.da.committable.sel(name=names), ("name",)).to_numpy()
+    return np.where(committable[..., None], history, 1.0)
+
+
+def _dispatch_before(
+    n: Network,
+    c: Any,
+    names: pd.Index,
+    sns: pd.Index,
+    status: np.ndarray,
+    *,
+    sc: Scenarios,
+) -> np.ndarray:
+    """Return the dispatch right before the horizon, over the scenario axis and `name`.
+
+    Within `n.snapshots` the solved dispatch is read. Before it, `p_init` is
+    read for a component whose `status` before the horizon is on, and zero
+    for one that is off. NaN marks a dispatch that is not known.
+    """
+    attr = "p0" if c.name in n.branch_components else "p"
+    start = _window_start(n, sns)
+    if start and not c.dynamic[attr].empty:
+        held = c.da[attr].sel(name=names).isel(snapshot=start - 1)
+        return sc.over(held, ("name",)).to_numpy().astype(np.float64)
+    p_init = sc.over(c.da.p_init.sel(name=names), ("name",)).to_numpy()
+    return np.where(status > 0, p_init, 0.0)
+
+
+def _first_grid(
+    values: np.ndarray, names: pd.Index, sns: pd.Index, sc: Scenarios
+) -> Any:
+    """Place one value per component at the horizon's first snapshot and zero elsewhere."""
+    grid = np.zeros((*values.shape, len(sns)))
+    grid[..., 0] = values
+    return sc.ones(_names(names), sns).copy(data=grid)
 
 
 def _window_terms(
@@ -1131,10 +1122,13 @@ def define_commitment_constraints(
                 n, m, c, ext, sns, sc=sc, pe=pe, sets=(N, T), attr=attr, status=status
             )
 
-        up_before = _per_component(c, "up_time_before", com, np.float64) > 0
-        first = np.zeros((len(com), len(sns)))
-        first[up_before, 0] = 1.0
-        starts = _over_time(first, com, sns)
+        lengths = {
+            kind: _per_component(c, f"min_{kind}_time", com, np.float64).astype(int)
+            for kind in ("up", "down")
+        }
+        span = max(int(lengths["up"].max()), int(lengths["down"].max()), 1) + 1
+        history = _status_history(n, c, com, sns, span, sc=sc)
+        starts = _first_grid(history[..., 0], com, sns, sc)
         ones = sc.ones(labels[0], sns)
         previous = _lagged_terms(
             f"{c_name}-com-transition-previous",
@@ -1155,9 +1149,7 @@ def define_commitment_constraints(
             ("shut-down", shut_down, 1.0),
         ):
             name = f"{c_name}-com-transition-{kind}"
-            bound = _long_of(
-                f"{name}-bound", sets, sc.over(sign * starts * ones, held_dims)
-            )
+            bound = _long_of(f"{name}-bound", sets, sc.over(sign * starts, held_dims))
             m.add_constraints(
                 name,
                 transition[*axes] + sign * change >= bound[*axes],
@@ -1165,37 +1157,54 @@ def define_commitment_constraints(
                 members=members,
             )
 
-        later = _flat_later(sns)
-        for kind, variable, minimum, sense in (
-            ("up", start_up, "min_up_time", 0.0),
-            ("down", shut_down, "min_down_time", 1.0),
-        ):
-            lengths = _per_component(c, minimum, com, np.float64).astype(int)
-            if not (lengths > 0).any() or len(sns) < 2:
+        switches = history[..., :-1] - history[..., 1:]
+        lags = np.arange(1, history.shape[-1])
+        position = np.arange(len(sns))
+        active_rows = _active(c, sns, com, sc)
+        for kind, variable, sense in (("up", start_up, 0.0), ("down", shut_down, 1.0)):
+            reach = lengths[kind]
+            if not (reach > 0).any():
                 continue
-            keep = lengths > 0
+            keep = reach > 0
             name = f"{c_name}-com-{kind}-time"
+            sign = -1.0 if kind == "up" else 1.0
+            past = np.clip(-sign * switches, 0.0, None)
+            within = (lags[None, None, :] + position[None, :, None]) < reach[
+                :, None, None
+            ]
+            limit = active_rows.copy(
+                data=sense - np.einsum("...nl,ntl->...nt", past, within)
+            )
+            counted = xr.DataArray(
+                keep.astype(float), coords={"name": labels[0]}, dims=("name",)
+            )
+            rows = sc.over(active_rows * counted, held_dims)
             window = _window_terms(
                 name,
                 (N, T),
-                (labels[0][keep], later),
+                (labels[0][keep], sns),
                 sc,
                 pe,
                 variable=variable,
-                lengths=lengths[keep],
+                lengths=reach[keep],
             )
-            sign = -1.0 if kind == "up" else 1.0
             body = sign * status[*axes] + window
+            bound = _long_of(
+                f"{name}-bound",
+                sets,
+                sc.over(limit, held_dims),
+                keep=rows.to_numpy() > 0,
+            )
             m.add_constraints(
                 name,
-                body <= sense,
-                over=_domain_of(f"{name}-rows", sets, sc.ones(labels[0][keep], later)),
-                members={"name": com[keep], "snapshot": later},
+                body <= bound[*axes],
+                over=_domain_of(f"{name}-rows", sets, rows),
+                members={"name": com[keep]},
             )
 
-        _define_initial_status(m, c, com, sns, sc=sc, pe=pe, sets=(N, T), status=status)
         if linearized:
             _tighten_relaxation(
+                n,
                 m,
                 c,
                 com,
@@ -1347,6 +1356,7 @@ def _define_big_m_commitment(
 
 
 def _tighten_relaxation(
+    n: Network,
     m: NimoptModel,
     c: Any,
     com: Any,
@@ -1378,25 +1388,17 @@ def _tighten_relaxation(
         return
     N, T = sets
     names = com[equal]
-    later = _flat_later(sns)
     sets_of = sc.sets + (N, *pe.sets, T)
     axes = (*sc.sets, N, *pe.sets, T)
-    rows = _domain_of(
-        f"{c.name}-com-relaxed-rows",
-        sets_of,
-        _active(c, sns, names, sc).sel(snapshot=later),
-    )
-    var = m.var(f"{c.name}-{attr}")
-    status = m.var(f"{c.name}-status")
-    start_up = m.var(f"{c.name}-start_up")
+    held_dims = ("name", "snapshot")
+    variables = {
+        "p": m.var(f"{c.name}-{attr}"),
+        "status": m.var(f"{c.name}-status"),
+        "start_up": m.var(f"{c.name}-start_up"),
+    }
     held = nominal.sel(name=names)
     min_pu, max_pu = sc.bounds_pu(c, attr, sns, names)
     lower_p, upper_p = min_pu * held, max_pu * held
-
-    def share(name: str, grid: Any) -> Any:
-        return _sparse_of(
-            name, sets_of, sc.over(grid.sel(snapshot=later), ("name", "snapshot"))
-        )
 
     ramp = {
         kind: held * sc.grid(c, f"ramp_limit_{kind}", sns, names)
@@ -1406,54 +1408,71 @@ def _tighten_relaxation(
         kind: xr.where(np.isfinite(value), value, held) for kind, value in ramp.items()
     }
 
+    status_before = _status_history(n, c, names, sns, 1, sc=sc)[..., 0]
+    before = _dispatch_before(n, c, names, sns, status_before, sc=sc)
+    ones = sc.ones(_names(names), sns)
+    active = sc.active(c, sns, names).to_numpy()
+    first = np.arange(len(sns)) == 0
+    reaching = active & (~first | ~np.isnan(before)[..., None])
+    initial = ones.copy(data=np.broadcast_to(first, ones.shape).astype(float))
+    value_before = {
+        "p": ones.copy(
+            data=np.broadcast_to(np.nan_to_num(before)[..., None], ones.shape)
+        ),
+        "status": ones.copy(data=np.broadcast_to(status_before[..., None], ones.shape)),
+    }
+
     families = {
         "p-before": [
-            (var, 1, 1.0, None),
-            (status, 1, -1.0, ramp["shut_down"]),
-            (status, 0, -1.0, upper_p - ramp["shut_down"]),
-            (start_up, 0, 1.0, upper_p - ramp["shut_down"]),
+            ("p", 1, 1.0, None),
+            ("status", 1, -1.0, ramp["shut_down"]),
+            ("status", 0, -1.0, upper_p - ramp["shut_down"]),
+            ("start_up", 0, 1.0, upper_p - ramp["shut_down"]),
         ],
         "p-current": [
-            (var, 0, 1.0, None),
-            (status, 0, -1.0, upper_p),
-            (start_up, 0, 1.0, upper_p - ramp["start_up"]),
+            ("p", 0, 1.0, None),
+            ("status", 0, -1.0, upper_p),
+            ("start_up", 0, 1.0, upper_p - ramp["start_up"]),
         ],
         "partly-start-up": [
-            (var, 0, 1.0, None),
-            (var, 1, -1.0, None),
-            (status, 0, -1.0, lower_p + ramp["up"]),
-            (status, 1, 1.0, lower_p),
-            (start_up, 0, 1.0, lower_p + ramp["up"] - ramp["start_up"]),
+            ("p", 0, 1.0, None),
+            ("p", 1, -1.0, None),
+            ("status", 0, -1.0, lower_p + ramp["up"]),
+            ("status", 1, 1.0, lower_p),
+            ("start_up", 0, 1.0, lower_p + ramp["up"] - ramp["start_up"]),
         ],
         "partly-shut-down": [
-            (var, 1, 1.0, None),
-            (var, 0, -1.0, None),
-            (status, 1, -1.0, ramp["shut_down"]),
-            (status, 0, 1.0, ramp["shut_down"] - ramp["down"]),
-            (start_up, 0, -1.0, lower_p + ramp["down"] - ramp["shut_down"]),
+            ("p", 1, 1.0, None),
+            ("p", 0, -1.0, None),
+            ("status", 1, -1.0, ramp["shut_down"]),
+            ("status", 0, 1.0, ramp["shut_down"] - ramp["down"]),
+            ("start_up", 0, -1.0, lower_p + ramp["down"] - ramp["shut_down"]),
         ],
     }
     for family, terms in families.items():
         name = f"{c.name}-com-{family}"
+        cells = active if family == "p-current" else reaching
+        mark = ones.copy(data=cells.astype(float))
         body = None
-        for k, (variable, lag, sign, grid) in enumerate(terms):
+        constant = 0.0 * ones
+        for k, (kind, lag, sign, grid) in enumerate(terms):
+            variable = variables[kind]
+            weight = ones if grid is None else grid
             if lag == 0:
                 if grid is None:
                     held_terms = [variable[*axes]]
                 else:
-                    coefficient = share(f"{name}-{k}", grid)
+                    coefficient = _sparse_of(
+                        f"{name}-{k}", sets_of, sc.over(weight * mark, held_dims)
+                    )
                     if not coefficient.nnz:
                         continue
                     held_terms = [coefficient[*axes] * variable[*axes]]
             else:
-                over = (
-                    sc.ones(_names(names), later)
-                    if grid is None
-                    else grid.sel(snapshot=later)
-                )
+                constant = constant + sign * weight * value_before[kind] * initial
                 held_terms = _lagged_terms(
                     f"{name}-{k}",
-                    over,
+                    weight * mark,
                     variable,
                     lag,
                     sets=sets_of,
@@ -1467,54 +1486,15 @@ def _tighten_relaxation(
                 body = term if body is None else body + term
         if body is None:
             continue
+        bound = _long_of(
+            f"{name}-bound", sets_of, sc.over(-constant, held_dims), keep=cells
+        )
         m.add_constraints(
             name,
-            body <= 0.0,
-            over=rows,
-            members={"name": names, "snapshot": later},
+            body <= bound[*axes],
+            over=_domain_of(f"{name}-rows", sets_of, mark),
+            members={"name": names},
         )
-
-
-def _define_initial_status(
-    m: NimoptModel,
-    c: Any,
-    com: Any,
-    sns: pd.Index,
-    *,
-    sc: Scenarios,
-    pe: Periods,
-    sets: tuple,
-    status: Any,
-) -> None:
-    """Hold a committable at the status its history has not yet released it from.
-
-    A component that ran for fewer snapshots than its minimum up time stays
-    up for the remainder, and one that stood for fewer than its minimum down
-    time stays down; the rest are free from the first snapshot.
-    """
-    N, T = sets
-    steps = np.arange(1, len(sns) + 1)[None, :]
-    for kind, minimum, before, value in (
-        ("up", "min_up_time", "up_time_before", 1.0),
-        ("down", "min_down_time", "down_time_before", 0.0),
-    ):
-        held = _per_component(c, before, com, np.float64)
-        must = np.clip(_per_component(c, minimum, com, np.float64) - held, 0, None)
-        stays = (must[:, None] >= steps) & (held > 0)[:, None]
-        if not stays.any():
-            continue
-        name = f"{c.name}-com-status-min_{kind}_time_must_stay_up"
-        marked = xr.DataArray(
-            stays.astype(float),
-            coords={"name": _names(com), "snapshot": sns},
-            dims=("name", "snapshot"),
-        )
-        rows = _domain_of(
-            f"{name}-rows",
-            sc.sets + (N, *pe.sets, T),
-            sc.ones(_names(com), sns) * marked,
-        )
-        m.add_constraints(name, status[*sc.sets, N, *pe.sets, T] == value, over=rows)
 
 
 def define_ramp_limit_constraints(
@@ -1522,76 +1502,181 @@ def define_ramp_limit_constraints(
 ) -> None:
     """Bound the change in an operating variable between consecutive snapshots.
 
-    A row stands at every snapshot but the first, where the reference to the
-    previous one reaches outside the horizon. A fixed component bounds the
-    change by its own capacity and an extendable one by the capacity column.
+    A row stands at every snapshot that has a predecessor in its period, and
+    at the horizon's first snapshot where the dispatch before it is known:
+    the solved dispatch before a horizon that starts after `n.snapshots[0]`,
+    `p_init` for a component that was on, or zero for one that was off. A
+    row stands where the ordinary or the transition limit is set, and an
+    unset limit reads one. A fixed component bounds the change by its own
+    capacity and an extendable one by the capacity column.
 
     A committable component ramps against its commitment: it may reach its
     start-up limit in the snapshot it starts, its shut-down limit in the one
-    it stops, and its ordinary limit while it runs. A committable whose
-    capacity is also chosen states no ramp row, as PyPSA states none.
+    it stops, and its ordinary limit while it runs. A modular committable
+    ramps by its module size times the modules running. A committable whose
+    capacity is chosen ramps through a big M.
     """
-    if len(sns) < 2:
-        return
-    T = m.sets["snapshot"]
+    later = pd.Index(sns).isin(pe.later)
+    first = np.arange(len(sns)) == 0
     for c_name, attr in RAMPING:
         c = n.c[c_name]
         if c.static.empty:
             continue
         active = c.active_assets
-        if active.empty or {"ramp_limit_up", "ramp_limit_down"}.isdisjoint(c.static):
+        if active.empty or not _ramps(c):
             continue
         committable = active.intersection(c.committables)
-        names = active.difference(committable.intersection(c.extendables))
-        if names.empty:
+        sized = committable.intersection(c.extendables).difference(c.modulars)
+        names = active.difference(sized)
+        if not names.empty:
+            _ramp_rows(
+                n,
+                m,
+                c,
+                attr=attr,
+                names=names,
+                sns=sns,
+                sc=sc,
+                pe=pe,
+                later=later,
+                first=first,
+            )
+        if not sized.empty:
+            _ramp_big_m_rows(
+                n,
+                m,
+                c,
+                attr=attr,
+                names=sized,
+                sns=sns,
+                sc=sc,
+                pe=pe,
+                later=later,
+                first=first,
+            )
+
+
+def _ramps(c: Any) -> bool:
+    """Return whether any component sets a ramp limit at any snapshot."""
+    for side in ("up", "down", "start_up", "shut_down"):
+        attr = f"ramp_limit_{side}"
+        if attr in c.static and c.static[attr].notna().any():
+            return True
+        if attr in c.dynamic and c.dynamic[attr].notna().to_numpy().any():
+            return True
+    return False
+
+
+def _ramp_frame(
+    n: Network,
+    c: Any,
+    names: pd.Index,
+    sns: pd.Index,
+    *,
+    sc: Scenarios,
+    later: np.ndarray,
+    first: np.ndarray,
+) -> tuple:
+    """Return the status and dispatch before the horizon and the cells a row may stand at.
+
+    The cells are the active snapshots with a predecessor in their period,
+    and the horizon's first snapshot where the dispatch before it is known.
+    """
+    status = _status_history(n, c, names, sns, 1, sc=sc)[..., 0]
+    before = _dispatch_before(n, c, names, sns, status, sc=sc)
+    known = ~np.isnan(before)
+    cells = sc.active(c, sns, names).to_numpy() & (later | (first & known[..., None]))
+    return status, np.nan_to_num(before), cells
+
+
+def _ramp_limits(
+    c: Any, names: pd.Index, sns: pd.Index, side: str, sc: Scenarios
+) -> tuple:
+    """Return the ordinary and the transition limit of `side`, and where either is set.
+
+    An unset limit reads one.
+    """
+    transition = "start_up" if side == "up" else "shut_down"
+    limit = sc.grid(c, f"ramp_limit_{side}", sns, names)
+    edge = sc.grid(c, f"ramp_limit_{transition}", sns, names)
+    stated = np.isfinite(limit.to_numpy()) | np.isfinite(edge.to_numpy())
+    limit = xr.where(np.isfinite(limit), limit, 1.0)
+    edge = xr.where(np.isfinite(edge), edge, 1.0)
+    return (
+        sc.over(limit, ("name", "snapshot")),
+        sc.over(edge, ("name", "snapshot")),
+        stated,
+    )
+
+
+def _ramp_rows(
+    n: Network,
+    m: NimoptModel,
+    c: Any,
+    *,
+    attr: str,
+    names: pd.Index,
+    sns: pd.Index,
+    sc: Scenarios,
+    pe: Periods,
+    later: np.ndarray,
+    first: np.ndarray,
+) -> None:
+    """Declare the ramp rows of the components whose capacity is a parameter or a column."""
+    c_name = c.name
+    T, N = m.sets["snapshot"], m.sets[c_name]
+    held_dims = ("name", "snapshot")
+    sets = sc.sets + (N, *pe.sets, T)
+    axes = (*sc.sets, N, *pe.sets, T)
+    var = m.var(f"{c_name}-{attr}")
+    committable = names.intersection(c.committables)
+    ext = names.intersection(c.extendables).difference(committable)
+    modular = committable.intersection(c.extendables)
+    status, before, cells = _ramp_frame(
+        n, c, names, sns, sc=sc, later=later, first=first
+    )
+    ones = sc.ones(_names(names), sns)
+
+    def per_name(members: pd.Index) -> xr.DataArray:
+        return xr.DataArray(
+            np.isin(_names(names), _names(members)).astype(float),
+            coords={"name": _names(names)},
+            dims=("name",),
+        )
+
+    extendable, commits, counted = (
+        per_name(ext),
+        per_name(committable),
+        per_name(modular),
+    )
+    p_nom = sc.static(c, nominal_attrs[c_name], names)
+    if not modular.empty:
+        size = sc.static(c, c._operational_attrs["nom_mod"], names)
+        p_nom = xr.where(counted > 0, size, p_nom)
+    for side in ("up", "down"):
+        limit, edge, stated = _ramp_limits(c, names, sns, side, sc)
+        at = stated & cells
+        if not at.any():
             continue
-        N = m.sets[c_name]
-        var = m.var(f"{c_name}-{attr}")
-        ext = c.extendables.intersection(names)
-        commits = committable.intersection(names)
-        held_dims = ("name", "snapshot")
-        after = pe.later
-        sets = sc.sets + (N, *pe.sets, T)
-        axes = (*sc.sets, N, *pe.sets, T)
-        ones = _active(c, sns, names, sc).sel(snapshot=after)
-        by_name = {"name": _names(names)}
-        extendable = xr.DataArray(
-            np.isin(_names(names), _names(ext)).astype(float),
-            coords=by_name,
-            dims=("name",),
-        )
-        commits_at = xr.DataArray(
-            np.isin(_names(names), _names(commits)).astype(float),
-            coords=by_name,
-            dims=("name",),
-        )
-        p_nom = sc.static(c, nominal_attrs[c_name], names)
-        for side in ("up", "down"):
-            limit = sc.grid(c, f"ramp_limit_{side}", sns, names).sel(snapshot=after)
-            over_rows = sc.over(limit * ones, held_dims)
-            stated = np.isfinite(over_rows.to_numpy())
-            if not stated.any():
-                continue
-            name = f"{c_name}-{attr}-ramp_limit_{side}"
-            sign = 1.0 if side == "up" else -1.0
-            body = var[*axes] - var[*sc.sets, N, *pe.sets, T - 1]
+        mark = ones.copy(data=at.astype(float))
+        name = f"{c_name}-{attr}-ramp_limit_{side}"
+        sign = 1.0 if side == "up" else -1.0
+        body = var[*axes] - var[*sc.sets, N, *pe.sets, T - 1]
 
-            share = _sparse_of(
-                f"{name}-share",
-                sets,
-                sc.over(xr.where(extendable > 0, limit, 0.0) * ones, held_dims),
-            )
-            if share.nnz:
-                cap = m.var(f"{c_name}-{nominal_attrs[c_name]}")
-                body = body - sign * share[*axes] * cap[N]
+        share = _sparse_of(
+            f"{name}-share",
+            sets,
+            sc.over(xr.where(extendable > 0, limit, 0.0) * mark, held_dims),
+        )
+        if share.nnz:
+            cap = m.var(f"{c_name}-{nominal_attrs[c_name]}")
+            body = body - sign * share[*axes] * cap[N]
 
-            transition = "start_up" if side == "up" else "shut_down"
-            edge = sc.grid(c, f"ramp_limit_{transition}", sns, names).sel(
-                snapshot=after
-            )
-            edge = xr.where(np.isfinite(edge), edge, 1.0)
-            running = xr.where(commits_at > 0, (limit - edge) * p_nom, 0.0)
-            switching = xr.where(commits_at > 0, edge * p_nom, 0.0)
+        start = before.copy()
+        pairs: tuple = ()
+        if not committable.empty:
+            running = xr.where(commits > 0, (limit - edge) * p_nom, 0.0)
+            switching = xr.where(commits > 0, edge * p_nom, 0.0)
             # the ordinary limit holds against the status the unit had, and
             # the transition limit against the one it takes; the two swap
             # ends between a rise and a fall
@@ -1600,45 +1685,121 @@ def define_ramp_limit_constraints(
                 if side == "up"
                 else ((0, running), (1, switching))
             )
-            status = None
-            for lag, grid in pairs:
-                carried = _sparse_of(
-                    f"{name}-status-{lag}", sets, sc.over(grid * ones, held_dims)
-                )
-                if not carried.nnz:
-                    continue
-                if status is None:
-                    status = m.var(f"{c_name}-status")
-                reference = (
-                    status[*axes]
-                    if lag == 0
-                    else status[*sc.sets, N, *pe.sets, T - lag]
-                )
-                body = body - sign * (carried[*axes] * reference)
+            previous = running if side == "up" else switching
+            first_previous = sc.over(previous.isel(snapshot=0), ("name",))
+            start = start + sign * first_previous.to_numpy() * status
+        for lag, grid in pairs:
+            carried = _sparse_of(
+                f"{name}-status-{lag}", sets, sc.over(grid * mark, held_dims)
+            )
+            if not carried.nnz:
+                continue
+            status_var = m.var(f"{c_name}-status")
+            reference = (
+                status_var[*axes]
+                if lag == 0
+                else status_var[*sc.sets, N, *pe.sets, T - lag]
+            )
+            body = body - sign * (carried[*axes] * reference)
 
-            free = (extendable > 0) | (commits_at > 0)
+        free = (extendable > 0) | (commits > 0)
+        base = sc.over(sign * xr.where(free, 0.0, limit * p_nom), held_dims)
+        values = base.to_numpy().copy()
+        values[..., 0] += start
+        bound = _long_of(f"{name}-bound", sets, base.copy(data=values), keep=at)
+        relation = body <= bound[*axes] if side == "up" else body >= bound[*axes]
+        reached = at.any(axis=tuple(k for k in range(at.ndim) if k != len(sc.sets)))
+        members = {"name": names[reached]}
+        if not at[..., 0].any():
+            members.update(pe.later_members)
+        m.add_constraints(
+            name,
+            relation,
+            over=_domain_of(f"{name}-rows", sets, mark),
+            members=members,
+        )
+
+
+def _ramp_big_m_rows(
+    n: Network,
+    m: NimoptModel,
+    c: Any,
+    *,
+    attr: str,
+    names: pd.Index,
+    sns: pd.Index,
+    sc: Scenarios,
+    pe: Periods,
+    later: np.ndarray,
+    first: np.ndarray,
+) -> None:
+    """Declare the big-M ramp rows of committables whose capacity is a column.
+
+    Each limit holds only in its own state: the ordinary limits while the
+    unit runs, the start-up limit in the snapshot it starts and the shut-down
+    limit in the one it stops. Elsewhere the big M relaxes the row.
+    """
+    c_name = c.name
+    T, N = m.sets["snapshot"], m.sets[c_name]
+    held_dims = ("name", "snapshot")
+    sets = sc.sets + (N, *pe.sets, T)
+    axes = (*sc.sets, N, *pe.sets, T)
+    var = m.var(f"{c_name}-{attr}")
+    cap = m.var(f"{c_name}-{nominal_attrs[c_name]}")
+    status_var = m.var(f"{c_name}-status")
+    status, before, cells = _ramp_frame(
+        n, c, names, sns, sc=sc, later=later, first=first
+    )
+    ones = sc.ones(_names(names), sns)
+    raw = c.get_committable_big_m_values(
+        names=names, committable_big_m=getattr(n, "_committable_big_m", None)
+    )
+    if "snapshot" not in raw.dims:
+        raw = raw.expand_dims(snapshot=sns)
+    big_m = sc.over(raw.sel(snapshot=sns) * ones, held_dims)
+    initial = ones.copy(data=np.broadcast_to(first, ones.shape).astype(float))
+    previous = ones.copy(data=np.broadcast_to(status[..., None], ones.shape))
+    dispatched = ones.copy(data=np.broadcast_to(before[..., None], ones.shape))
+    delta = var[*axes] - var[*sc.sets, N, *pe.sets, T - 1]
+    for side in ("up", "down"):
+        limit, edge, stated = _ramp_limits(c, names, sns, side, sc)
+        at = stated & cells
+        if not at.any():
+            continue
+        mark = ones.copy(data=at.astype(float))
+        sign = 1.0 if side == "up" else -1.0
+        states = (
+            (("run", limit, None), ("start", edge, "start_up"))
+            if side == "up"
+            else (("run", limit, "status"), ("shut", edge, "shut_down"))
+        )
+        for state, share, held in states:
+            name = f"{c_name}-{attr}-ramp_limit_{side}-{state}-bigM"
+            body = delta
+            coefficient = _sparse_of(
+                f"{name}-share", sets, sc.over(share * mark, held_dims)
+            )
+            body = body - sign * coefficient[*axes] * cap[N]
+            weight = _sparse_of(f"{name}-big_m", sets, sc.over(big_m * mark, held_dims))
+            if held is None:
+                body = body + weight[*axes] * status_var[*sc.sets, N, *pe.sets, T - 1]
+                constant = big_m - big_m * previous * initial
+            else:
+                body = body + sign * weight[*axes] * m.var(f"{c_name}-{held}")[*axes]
+                constant = sign * big_m
             bound = _long_of(
                 f"{name}-bound",
                 sets,
-                sc.over(sign * xr.where(free, 0.0, limit * p_nom) * ones, held_dims),
-                keep=stated,
-            )
-            rows = _domain_of(
-                f"{name}-rows",
-                sets,
-                xr.DataArray(
-                    stated.astype(float),
-                    coords=over_rows.coords,
-                    dims=over_rows.dims,
-                ),
+                sc.over(constant + initial * dispatched, held_dims),
+                keep=at,
             )
             relation = body <= bound[*axes] if side == "up" else body >= bound[*axes]
-            reached = stated.any(axis=(0, 2) if sc else 1)
+            reached = at.any(axis=tuple(k for k in range(at.ndim) if k != len(sc.sets)))
             m.add_constraints(
                 name,
                 relation,
-                over=rows,
-                members={"name": names[reached], **pe.later_members},
+                over=_domain_of(f"{name}-rows", sets, mark),
+                members={"name": names[reached]},
             )
 
 
@@ -3608,9 +3769,7 @@ def create_model(
         raise ValueError(msg)
     sns = as_index(n, snapshots, "snapshots")
     pe = Periods.of(sns, multi_investment_periods)
-    _refuse_unsupported(
-        n, sns, pe, transmission_losses, linearized=bool(linearized_unit_commitment)
-    )
+    _refuse_unsupported(n, pe, transmission_losses)
     n._optimize_window = SnapshotWindow(n, sns, sns)
     m = NimoptModel("pypsa")
     n._model = m

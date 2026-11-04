@@ -241,12 +241,17 @@ def test_a_committed_unit_ramps_against_its_status(label, generator):
     assert b.objective == pytest.approx(a.objective, rel=1e-6)
 
 
-def test_a_ramp_limit_on_a_committable_whose_capacity_is_chosen_is_refused():
-    # PyPSA ramps an extendable committable through a big M; the backend
-    # declares no such row
-    n = sized_and_committed(ramp_limit_up=0.5, ramp_limit_down=0.5)
-    with pytest.raises(NotImplementedError, match="extendable committable"):
-        inner(n)
+def test_a_committable_whose_capacity_is_chosen_ramps_through_a_big_m():
+    def build():
+        return sized_and_committed(ramp_limit_up=0.5, ramp_limit_down=0.5)
+
+    a, b = solved(build(), "linopy"), solved(build(), "nimopt")
+    assert b.objective == pytest.approx(a.objective, rel=1e-6)
+    stated = {name for name in b.model.constraints if "ramp_limit" in name}
+    assert stated == {
+        f"Generator-p-ramp_limit_{side}-{state}-bigM"
+        for side, state in (("up", "run"), ("up", "start"), ("down", "run"))
+    } | {"Generator-p-ramp_limit_down-shut-bigM"}
 
 
 def test_a_link_carries_a_ramp_limit_too():
@@ -1226,6 +1231,197 @@ def test_the_cycle_basis_method_is_passed_to_pypsa(ac_dc_network):
         )
 
 
+def _history(T=6, load=(40, 90, 100, 30, 20, 95), **generator):
+    """A one-bus network with a peaking unit and a unit `g` set by `generator`."""
+    n = pypsa.Network()
+    n.set_snapshots(range(T))
+    n.add("Bus", "b")
+    n.add("Load", "l", bus="b", p_set=list(load)[:T])
+    n.add("Generator", "peak", bus="b", p_nom=1000, marginal_cost=200)
+    attrs = {"bus": "b", "p_nom": 100, "marginal_cost": 10, **generator}
+    n.add("Generator", "g", **attrs)
+    return n
+
+
+COMMITTED = {"committable": True, "p_min_pu": 0.2}
+HISTORY = {
+    "a unit off before, with a start-up limit": dict(
+        up_time_before=0, ramp_limit_start_up=0.3, ramp_limit_up=0.5, **COMMITTED
+    ),
+    "a unit down before, with a minimum down time": dict(
+        down_time_before=1, min_down_time=3, start_up_cost=5, **COMMITTED
+    ),
+    "a start-up limit alone": dict(
+        up_time_before=0, ramp_limit_start_up=0.25, **COMMITTED
+    ),
+    "an initial dispatch": {"ramp_limit_up": 0.2, "ramp_limit_down": 0.2, "p_init": 10},
+    "an initial dispatch of a committable": dict(
+        ramp_limit_up=0.2, ramp_limit_down=0.3, p_init=50, **COMMITTED
+    ),
+    "a committable whose capacity is chosen": dict(
+        p_nom=0,
+        p_nom_extendable=True,
+        p_nom_max=100,
+        capital_cost=1,
+        ramp_limit_up=0.3,
+        ramp_limit_down=0.4,
+        ramp_limit_start_up=0.5,
+        **COMMITTED,
+    ),
+    "a modular committable whose capacity is chosen": {
+        "p_nom": 0,
+        "p_nom_extendable": True,
+        "p_nom_min": 100,
+        "p_nom_max": 100,
+        "p_nom_mod": 10,
+        "capital_cost": 1,
+        "ramp_limit_up": 0.1,
+        "ramp_limit_start_up": 0.1,
+        "committable": True,
+    },
+}
+
+
+@pytest.mark.parametrize("generator", HISTORY.values(), ids=HISTORY.keys())
+def test_the_first_snapshot_reads_the_history_linopy_reads(generator):
+    a = solved(_history(**generator), "linopy")
+    b = solved(_history(**generator), "nimopt")
+    assert b.objective == pytest.approx(a.objective, rel=1e-6)
+    np.testing.assert_allclose(
+        b.c.generators.dynamic.p["g"].to_numpy(),
+        a.c.generators.dynamic.p["g"].to_numpy(),
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize(
+    "generator",
+    [
+        {"up_time_before": 0, "ramp_limit_start_up": 0.4, "ramp_limit_up": 0.5},
+        {
+            "p_init": 60,
+            "ramp_limit_down": 0.2,
+            "ramp_limit_up": 0.2,
+            "ramp_limit_start_up": 0.45,
+            "ramp_limit_shut_down": 0.45,
+        },
+    ],
+    ids=["a unit off before", "an initial dispatch"],
+)
+def test_a_relaxed_commitment_reads_the_history_linopy_reads(generator):
+    # the tightening rows at the first snapshot exist where the dispatch
+    # before it is known, and they are counted family by family
+    def build():
+        return _history(
+            committable=True,
+            p_min_pu=0.3,
+            start_up_cost=10,
+            shut_down_cost=10,
+            **generator,
+        )
+
+    counts = {}
+    for backend in ("linopy", "nimopt"):
+        m = build().optimize.create_model(
+            backend=backend, linearized_unit_commitment=True
+        )
+        families = [k for k in m.constraints if "ramp" in k or "-com-" in k]
+        counts[backend] = {
+            k: int((m.constraints[k].labels != -1).sum())
+            if backend == "linopy"
+            else m.constraints[k].constraint.n_rows
+            for k in families
+        }
+    stated = {k: v for k, v in counts["linopy"].items() if v}
+    assert counts["nimopt"] == stated
+    a = build()
+    a.optimize(solver_name=SOLVER, linearized_unit_commitment=True)
+    b = build()
+    b.optimize(backend="nimopt", solver_name=SOLVER, linearized_unit_commitment=True)
+    assert b.objective == pytest.approx(a.objective, rel=1e-6)
+
+
+@pytest.mark.parametrize(
+    "generator",
+    [
+        {"min_up_time": 3, "min_down_time": 2, "up_time_before": 1, "p_min_pu": 0.5},
+        {
+            "ramp_limit_up": 0.2,
+            "ramp_limit_down": 0.2,
+            "p_init": 10,
+            "committable": False,
+        },
+    ],
+    ids=["a committable", "a ramp limit"],
+)
+def test_a_horizon_after_a_solved_window_reads_its_status_and_dispatch(generator):
+    # the second solve reads the status and dispatch the first one wrote at
+    # the snapshot before its horizon
+    def build():
+        attrs = {"committable": True, **generator}
+        return _history(load=(90, 60, 60, 10, 90, 90), **attrs)
+
+    runs = {}
+    for backend in ("linopy", "nimopt"):
+        n = build()
+        n.optimize(backend=backend, solver_name=SOLVER)
+        n.optimize(backend=backend, solver_name=SOLVER, snapshots=n.snapshots[2:])
+        runs[backend] = n
+    a, b = runs["linopy"], runs["nimopt"]
+    assert b.objective == pytest.approx(a.objective, rel=1e-6)
+    np.testing.assert_allclose(
+        b.c.generators.dynamic.p["g"].to_numpy(),
+        a.c.generators.dynamic.p["g"].to_numpy(),
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize(
+    ("horizon", "overlap", "generator"),
+    [
+        (
+            4,
+            0,
+            {
+                "committable": True,
+                "p_min_pu": 0.3,
+                "min_up_time": 3,
+                "min_down_time": 2,
+            },
+        ),
+        (
+            5,
+            2,
+            {
+                "committable": True,
+                "p_min_pu": 0.3,
+                "min_up_time": 3,
+                "min_down_time": 2,
+            },
+        ),
+        (4, 0, {"ramp_limit_up": 0.4, "ramp_limit_start_up": 0.5}),
+    ],
+    ids=["a committable, no overlap", "a committable, overlapping", "a ramp limit"],
+)
+def test_the_rolling_horizon_carries_the_status_and_dispatch(
+    horizon, overlap, generator
+):
+    load = (40, 90, 100, 30, 20, 95, 10, 10, 80, 90, 30, 60)
+    runs = {}
+    for backend in ("linopy", "nimopt"):
+        n = _history(T=12, load=load, start_up_cost=30, **generator)
+        n.optimize.optimize_with_rolling_horizon(
+            horizon=horizon, overlap=overlap, backend=backend, solver_name=SOLVER
+        )
+        runs[backend] = n
+    a, b = runs["linopy"], runs["nimopt"]
+    np.testing.assert_allclose(
+        b.c.generators.dynamic.p.to_numpy(),
+        a.c.generators.dynamic.p.to_numpy(),
+        atol=1e-5,
+    )
+
+
 # --- what the backend does not state, it refuses ----------------------------
 
 
@@ -1233,31 +1429,6 @@ def test_a_quadratic_marginal_cost_is_refused():
     n = tiny(marginal_cost_quadratic=1.0)
     with pytest.raises(NotImplementedError, match="quadratic"):
         n.optimize.create_model(backend="nimopt")
-
-
-@pytest.mark.parametrize("committable", [False, True])
-def test_an_initial_dispatch_under_a_ramp_limit_is_refused(committable):
-    # PyPSA bounds the first snapshot by p_init; the backend declares no row
-    n = tiny(snapshots=3, ramp_limit_up=0.1, p_init=0.0, committable=committable)
-    with pytest.raises(NotImplementedError, match="p_init"):
-        n.optimize.create_model(backend="nimopt")
-
-
-@pytest.mark.parametrize(
-    ("generator", "message"),
-    [
-        ({"committable": True, "p_min_pu": 0.2}, "solved status"),
-        ({"ramp_limit_up": 0.2}, "solved dispatch"),
-    ],
-    ids=["a committable", "a ramp limit"],
-)
-def test_a_horizon_after_a_solved_window_is_refused(generator, message):
-    # PyPSA reads the solved status and dispatch of the snapshot before the
-    # horizon; the backend declares no row from them
-    n = tiny(snapshots=4, **generator)
-    n.optimize(backend="nimopt", solver_name=SOLVER, snapshots=n.snapshots[:2])
-    with pytest.raises(NotImplementedError, match=message):
-        n.optimize.create_model(backend="nimopt", snapshots=n.snapshots[2:])
 
 
 def test_the_rolling_horizon_reaches_the_dispatch_linopy_reaches():
