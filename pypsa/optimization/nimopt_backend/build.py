@@ -104,11 +104,15 @@ PERIOD_UNSTATED = ()
 
 def _refuse_unsupported(
     n: Network,
+    sns: pd.Index,
     pe: Periods,
     transmission_losses: Any,
+    *,
+    linearized: bool = False,
 ) -> None:
     """Raise for every feature of the network the nimopt backend does not state."""
     reasons = []
+    reasons.extend(_unstated_history(n, sns, linearized=linearized))
     if pe and PERIOD_UNSTATED:
         reasons.append("under investment periods: " + ", ".join(PERIOD_UNSTATED))
     if n.has_scenarios and SCENARIO_UNSTATED:
@@ -166,6 +170,68 @@ def _refuse_unsupported(
     if reasons:
         msg = "The nimopt backend does not state: " + "; ".join(reasons) + "."
         raise NotImplementedError(msg)
+
+
+RAMP_LIMITS = (
+    "ramp_limit_up",
+    "ramp_limit_down",
+    "ramp_limit_start_up",
+    "ramp_limit_shut_down",
+)
+
+
+def _ramping(c: Any, names: pd.Index) -> pd.Index:
+    """Return the members of `names` with a ramp limit at any snapshot."""
+    held = np.zeros(len(names), dtype=bool)
+    for attr in RAMP_LIMITS:
+        if names.empty or attr not in c.static:
+            continue
+        limit = c.da[attr].sel(name=names).notnull()
+        held |= limit.any([d for d in limit.dims if d != "name"]).to_numpy()
+    return names[held]
+
+
+def _unstated_history(n: Network, sns: pd.Index, *, linearized: bool) -> list:
+    """Return the reasons a network needs the dispatch or status before the horizon.
+
+    PyPSA bounds the first snapshot by `p_init` where a component ramps, and
+    by the solved `status` and dispatch of the snapshot before a horizon that
+    starts after `n.snapshots[0]`. It ramps an extendable committable through
+    a big M. The backend declares none of these rows.
+    """
+    reasons = []
+    start = n.snapshots.get_loc(sns[0])
+    for c_name in ("Generator", "Link", "Process"):
+        c = n.c[c_name]
+        if c.static.empty:
+            continue
+        active = c.active_assets
+        committable = c.committables.intersection(active)
+        ramping = _ramping(c, active)
+        if not _ramping(c, committable.intersection(c.extendables)).empty:
+            reasons.append(f"ramp limits of extendable committable {c_name} components")
+        if "p_init" in c.static:
+            relaxed = committable if linearized else committable[:0]
+            reads = ramping.union(relaxed)
+            if np.isfinite(_per_component(c, "p_init", reads, np.float64)).any():
+                reasons.append(
+                    f"p_init of {c_name} components with a ramp limit or a "
+                    f"relaxed commitment"
+                )
+        if not start:
+            continue
+        if not committable.empty and not c.dynamic.status.empty:
+            reasons.append(
+                f"committable {c_name} components on a horizon starting after "
+                f"the first snapshot, with a solved status before it"
+            )
+        dispatch = "p0" if c_name in n.branch_components else "p"
+        if not ramping.empty and not c.dynamic[dispatch].empty:
+            reasons.append(
+                f"ramp limits of {c_name} components on a horizon starting after "
+                f"the first snapshot, with a solved dispatch before it"
+            )
+    return reasons
 
 
 def _departs(c: Any, attr: str, default: float) -> bool:
@@ -3542,7 +3608,9 @@ def create_model(
         raise ValueError(msg)
     sns = as_index(n, snapshots, "snapshots")
     pe = Periods.of(sns, multi_investment_periods)
-    _refuse_unsupported(n, pe, transmission_losses)
+    _refuse_unsupported(
+        n, sns, pe, transmission_losses, linearized=bool(linearized_unit_commitment)
+    )
     n._optimize_window = SnapshotWindow(n, sns, sns)
     m = NimoptModel("pypsa")
     n._model = m

@@ -241,10 +241,12 @@ def test_a_committed_unit_ramps_against_its_status(label, generator):
     assert b.objective == pytest.approx(a.objective, rel=1e-6)
 
 
-def test_a_committable_whose_capacity_is_chosen_states_no_ramp_row():
+def test_a_ramp_limit_on_a_committable_whose_capacity_is_chosen_is_refused():
+    # PyPSA ramps an extendable committable through a big M; the backend
+    # declares no such row
     n = sized_and_committed(ramp_limit_up=0.5, ramp_limit_down=0.5)
-    model = inner(n)
-    assert not [name for name in model.constraints if "ramp_limit" in name]
+    with pytest.raises(NotImplementedError, match="extendable committable"):
+        inner(n)
 
 
 def test_a_link_carries_a_ramp_limit_too():
@@ -1231,6 +1233,60 @@ def test_a_quadratic_marginal_cost_is_refused():
     n = tiny(marginal_cost_quadratic=1.0)
     with pytest.raises(NotImplementedError, match="quadratic"):
         n.optimize.create_model(backend="nimopt")
+
+
+@pytest.mark.parametrize("committable", [False, True])
+def test_an_initial_dispatch_under_a_ramp_limit_is_refused(committable):
+    # PyPSA bounds the first snapshot by p_init; the backend declares no row
+    n = tiny(snapshots=3, ramp_limit_up=0.1, p_init=0.0, committable=committable)
+    with pytest.raises(NotImplementedError, match="p_init"):
+        n.optimize.create_model(backend="nimopt")
+
+
+@pytest.mark.parametrize(
+    ("generator", "message"),
+    [
+        ({"committable": True, "p_min_pu": 0.2}, "solved status"),
+        ({"ramp_limit_up": 0.2}, "solved dispatch"),
+    ],
+    ids=["a committable", "a ramp limit"],
+)
+def test_a_horizon_after_a_solved_window_is_refused(generator, message):
+    # PyPSA reads the solved status and dispatch of the snapshot before the
+    # horizon; the backend declares no row from them
+    n = tiny(snapshots=4, **generator)
+    n.optimize(backend="nimopt", solver_name=SOLVER, snapshots=n.snapshots[:2])
+    with pytest.raises(NotImplementedError, match=message):
+        n.optimize.create_model(backend="nimopt", snapshots=n.snapshots[2:])
+
+
+def test_the_rolling_horizon_reaches_the_dispatch_linopy_reaches():
+    # each window starts from the store level the window before it ends at,
+    # less the standing loss over the snapshot between them
+    def build():
+        n = pypsa.Network()
+        n.set_snapshots(range(8))
+        n.add("Bus", "b")
+        n.add("Generator", "g", bus="b", p_nom=50, marginal_cost=10)
+        n.add("Generator", "peak", bus="b", p_nom=100, marginal_cost=100)
+        n.add("Store", "s", bus="b", e_nom=40, standing_loss=0.02, e_initial=10)
+        n.add("Load", "l", bus="b", p_set=[20, 80, 20, 80, 20, 80, 20, 80])
+        return n
+
+    runs = {}
+    for backend in ("linopy", "nimopt"):
+        n = build()
+        n.optimize.optimize_with_rolling_horizon(
+            horizon=4, overlap=1, backend=backend, solver_name=SOLVER
+        )
+        runs[backend] = n
+    a, b = runs["linopy"], runs["nimopt"]
+    for c_name, attr in (("generators", "p"), ("stores", "e")):
+        np.testing.assert_allclose(
+            getattr(b.c, c_name).dynamic[attr].to_numpy(),
+            getattr(a.c, c_name).dynamic[attr].to_numpy(),
+            atol=1e-6,
+        )
 
 
 def test_a_period_horizon_optimised_without_periods_is_refused(ac_dc_periods):
