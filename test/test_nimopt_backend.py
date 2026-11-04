@@ -1129,6 +1129,94 @@ def test_a_time_varying_start_up_cost_reaches_the_optimum_linopy_reaches():
     assert np.allclose(status, a.c.generators.dynamic.status["cheap"].to_numpy())
 
 
+def _ring(transformer=None, scenarios=False):
+    """Three buses in a ring, a cheap generator at a and the load at c.
+
+    The angle limits bind, so the dear generator at c covers the load the
+    ring cannot carry.
+    """
+    n = pypsa.Network()
+    n.set_snapshots(range(3))
+    for bus in "abc":
+        n.add("Bus", bus, v_nom=380)
+    n.add("Generator", "cheap", bus="a", p_nom=1000, marginal_cost=10)
+    n.add("Generator", "dear", bus="c", p_nom=1000, marginal_cost=100)
+    n.add("Load", "l", bus="c", p_set=[300, 500, 400])
+    n.add("Line", "ab", bus0="a", bus1="b", x=10, r=1, s_nom=1000, v_ang_max=0.5)
+    n.add("Line", "ac", bus0="a", bus1="c", x=10, r=1, s_nom=1000, v_ang_max=0.5)
+    if transformer is None:
+        n.add("Line", "bc", bus0="b", bus1="c", x=10, r=1, s_nom=1000, v_ang_max=0.4)
+    else:
+        n.add(
+            "Transformer",
+            "bc",
+            bus0="b",
+            bus1="c",
+            x=0.1,
+            s_nom=1000,
+            v_ang_max=2.0,
+            **transformer,
+        )
+    if scenarios:
+        n.set_scenarios({"low": 0.5, "high": 0.5})
+    return n
+
+
+@pytest.mark.parametrize(
+    ("transformer", "scenarios"),
+    [
+        (None, False),
+        ({"phase_shift": 1.5}, False),
+        ({"phase_shift_min": -5, "phase_shift_max": 5}, False),
+        ({"phase_shift": 1.5}, True),
+    ],
+    ids=["lines", "a fixed shift", "a chosen shift", "a fixed shift per scenario"],
+)
+def test_a_voltage_angle_limit_reaches_the_optimum_linopy_reaches(
+    transformer, scenarios
+):
+    a = solved(_ring(transformer, scenarios), "linopy")
+    b = solved(_ring(transformer, scenarios), "nimopt")
+    assert b.objective == pytest.approx(a.objective, rel=1e-6)
+    # without the limits the cheap generator covers the whole load
+    assert b.objective > 10 * 1200 + 1
+    assert [k for k in b.model.constraints if "v_ang" in k] == [
+        k for k in a.model.constraints if "v_ang" in k
+    ]
+    for c_name in ("lines", "transformers"):
+        np.testing.assert_allclose(
+            getattr(b.c, c_name).dynamic.p0.to_numpy(),
+            getattr(a.c, c_name).dynamic.p0.to_numpy(),
+            atol=1e-4,
+        )
+
+
+def test_a_time_varying_phase_shift_enters_the_voltage_law():
+    # the shift moves the transformer's flow at the second and third snapshot
+    def build():
+        n = _ring({})
+        n.c.lines.static["v_ang_max"] = np.inf
+        n.c.transformers.static["v_ang_max"] = np.inf
+        n.c.transformers.dynamic.phase_shift = pd.DataFrame(
+            {"bc": [0.0, 2.0, -1.0]}, index=n.snapshots
+        )
+        return n
+
+    a, b = solved(build(), "linopy"), solved(build(), "nimopt")
+    flow = b.c.transformers.dynamic.p0["bc"].to_numpy()
+    np.testing.assert_allclose(
+        flow, a.c.transformers.dynamic.p0["bc"].to_numpy(), atol=1e-4
+    )
+    assert flow[1] != pytest.approx(flow[2], abs=1.0)
+
+
+def test_a_minimum_voltage_angle_is_ignored_with_a_warning():
+    n = _ring()
+    n.c.lines.static.loc["ab", "v_ang_min"] = -0.5
+    with pytest.warns(DeprecationWarning, match="v_ang_min"):
+        n.optimize.create_model(backend="nimopt")
+
+
 def test_the_cycle_basis_method_is_passed_to_pypsa(ac_dc_network):
     with pytest.raises(ValueError, match="cycle_basis_method"):
         ac_dc_network.optimize.create_model(
@@ -1142,15 +1230,6 @@ def test_the_cycle_basis_method_is_passed_to_pypsa(ac_dc_network):
 def test_a_quadratic_marginal_cost_is_refused():
     n = tiny(marginal_cost_quadratic=1.0)
     with pytest.raises(NotImplementedError, match="quadratic"):
-        n.optimize.create_model(backend="nimopt")
-
-
-@pytest.mark.parametrize("component", ["Line", "Transformer"])
-def test_a_voltage_angle_limit_is_refused(component):
-    n = tiny()
-    n.add("Bus", "c")
-    n.add(component, "x", bus0="b", bus1="c", x=0.1, s_nom=100, v_ang_max=10.0)
-    with pytest.raises(NotImplementedError, match=f"{component} v_ang_max"):
         n.optimize.create_model(backend="nimopt")
 
 

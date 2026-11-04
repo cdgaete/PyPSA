@@ -13,6 +13,7 @@ before anything is built, rather than building a model that omits it.
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -89,10 +90,7 @@ UNSTATED_GLOBAL_TYPES = ()
 
 # attributes PyPSA states and the nimopt backend does not, each with the default
 # at which PyPSA's formulation and the backend's agree
-UNSTATED_ATTRIBUTES = (
-    ("Line", "v_ang_max", np.inf),
-    ("Transformer", "v_ang_max", np.inf),
-)
+UNSTATED_ATTRIBUTES = ()
 
 # families the backend does not yet state under a scenario dimension
 SCENARIO_UNSTATED = ()
@@ -451,9 +449,10 @@ def _shifting(n: Network) -> Any:
     c = n.c.transformers
     if c.static.empty:
         return c, c.static.index[:0]
-    active = c.static.loc[c.active_assets]
-    varying = active["phase_shift_min"] < active["phase_shift_max"]
-    return c, active.index[varying]
+    names = c.active_assets
+    low = _per_component(c, "phase_shift_min", names, np.float64)
+    high = _per_component(c, "phase_shift_max", names, np.float64)
+    return c, names[low < high]
 
 
 def define_phase_shift_variables(
@@ -2047,21 +2046,100 @@ def define_kirchhoff_voltage_constraints(
                 * m.var("Transformer-phase_shift")[*sc.sets, TR, *pe.sets, T],
             )
         names = names.difference(shifting)
-        shift = _per_component(tr, "phase_shift", names, np.float64)
+        shift = sc.grid(tr, "phase_shift", sns, names).to_numpy()
         if (shift != 0).any():
-            constant = (
-                plain.loc[names].to_numpy().T @ shift * DEG_TO_RAD * KIRCHHOFF_SCALE
-            )
-            leading = (len(sc.names),) if sc else ()
-            grid = np.broadcast_to(
-                -constant[:, None], (*leading, len(cycles), len(sns))
-            )
+            constant = np.einsum("nc,...nt->...ct", plain.loc[names].to_numpy(), shift)
             rhs = _dense_of(
-                "kirchhoff_phase_shift", sc.sets + (C, *pe.sets, T), grid, pe
-            )
+                "kirchhoff_phase_shift",
+                sc.sets + (C, *pe.sets, T),
+                -constant * DEG_TO_RAD * KIRCHHOFF_SCALE,
+                pe,
+            )[*sc.sets, C, *pe.sets, T]
     m.add_constraints(
         "Kirchhoff-Voltage-Law", lhs == rhs, over=sc.sets + (C, *pe.sets, T)
     )
+
+
+def define_voltage_angle_constraints(
+    n: Network, m: NimoptModel, sns: pd.Index, sc: Scenarios, pe: Periods
+) -> None:
+    """Bound the voltage angle difference across each AC line and transformer.
+
+    The difference is `x_pu_eff` times the flow plus the phase shift of a
+    transformer, in radians. `v_ang_max` bounds its magnitude in degrees. Rows
+    exist where `v_ang_max` and the bound divided by `x_pu_eff` are finite.
+    A finite `v_ang_min` emits a DeprecationWarning and is ignored.
+    """
+    n.calculate_dependent_values()
+    T = m.sets["snapshot"]
+    held = ("name", "snapshot")
+    _, shifting = _shifting(n)
+    for c_name in ("Line", "Transformer"):
+        c = n.c[c_name]
+        if c.static.empty:
+            continue
+        if np.isfinite(c.static["v_ang_min"]).any():
+            warnings.warn(
+                f"The `v_ang_min` attribute of {c_name} is deprecated and "
+                "ignored. `v_ang_max` applies symmetrically as an absolute "
+                "voltage angle difference limit.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        finite = np.isfinite(c.static["v_ang_max"])
+        names = finite[finite].index.unique("name").intersection(c.active_assets)
+        if c_name == "Line" and not names.empty:
+            names = names[_per_component(c, "carrier", names, object) == "AC"]
+        if names.empty:
+            continue
+        N = m.sets[c_name]
+        sets = sc.sets + (N, *pe.sets, T)
+        axes = (*sc.sets, N, *pe.sets, T)
+        x = sc.static(c, "x_pu_eff", names)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cap = sc.over(sc.grid(c, "v_ang_max", sns, names) * DEG_TO_RAD / x, held)
+            offset = sc.over(
+                sc.grid(c, "phase_shift", sns, names) * DEG_TO_RAD / x
+                if c_name == "Transformer"
+                else xr.zeros_like(cap),
+                held,
+            )
+        bounded = sc.active(c, sns, names).to_numpy() & np.isfinite(cap.to_numpy())
+        picked = sc.ones(_names(names), sns) * xr.DataArray(
+            np.isin(_names(names), _names(shifting)).astype(float),
+            coords={"name": _names(names)},
+            dims=("name",),
+        )
+        chosen = sc.over(picked, held).to_numpy() > 0
+        flow = m.var(f"{c_name}-s")
+        for family, rows in (
+            ("v_ang", bounded & ~chosen),
+            ("v_ang-var", bounded & chosen),
+        ):
+            if not rows.any():
+                continue
+            other = tuple(i for i in range(rows.ndim) if i != len(sc.sets))
+            reached = rows.any(axis=other)
+            body = flow[*axes]
+            shift = 0.0 * cap
+            if family == "v_ang-var":
+                coefficient = _sparse_of(
+                    f"{c_name}-{family}-shift",
+                    sets,
+                    sc.over(picked * DEG_TO_RAD / x, held),
+                )
+                body = (
+                    body + coefficient[*axes] * m.var("Transformer-phase_shift")[*axes]
+                )
+            else:
+                shift = offset
+            for side, value in (("lower", -cap - shift), ("upper", cap - shift)):
+                name = f"{c_name}-{family}-{side}"
+                bound = _long_of(name, sets, value, keep=rows)
+                relation = (
+                    body >= bound[*axes] if side == "lower" else body <= bound[*axes]
+                )
+                m.add_constraints(name, relation, members={"name": names[reached]})
 
 
 # --- temporal rows -----------------------------------------------------------
@@ -3507,6 +3585,7 @@ def create_model(
     define_kirchhoff_voltage_constraints(
         n, m, sns, sc, pe, cycle_basis_method=cycle_basis_method
     )
+    define_voltage_angle_constraints(n, m, sns, sc, pe)
     define_storage_unit_constraints(n, m, sns, sc, pe)
     define_store_constraints(n, m, sns, sc, pe)
     define_total_supply_constraints(n, m, sns, sc=sc, pe=pe)
