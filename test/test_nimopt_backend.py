@@ -1097,12 +1097,60 @@ def test_a_modular_capacity_ramps():
     assert b.objective == pytest.approx(a.objective, rel=1e-6)
 
 
+def _two_buses():
+    """Two buses, a cheap generator on the first and a dear one on each."""
+    n = pypsa.Network()
+    n.set_snapshots(pd.RangeIndex(4))
+    n.add("Bus", "b")
+    n.add("Bus", "c")
+    n.add("Generator", "cheap", bus="b", p_nom=100, marginal_cost=10)
+    n.add("Generator", "dear", bus="b", p_nom=500, marginal_cost=100)
+    n.add("Generator", "dear_c", bus="c", p_nom=500, marginal_cost=100)
+    n.add("Load", "l", bus="b", p_set=[50, 80, 30, 60])
+    n.add("Load", "lc", bus="c", p_set=20)
+    return n
+
+
+def test_a_time_varying_start_up_cost_reaches_the_optimum_linopy_reaches():
+    # a start-up at the second or fourth snapshot costs 5000, so the unit
+    # stays on through the zero-load snapshots rather than restart there
+    def build():
+        n = _two_buses()
+        n.c.generators.static.loc["cheap", ["committable", "p_min_pu"]] = [True, 0.4]
+        n.c.generators.dynamic.start_up_cost = pd.DataFrame(
+            {"cheap": [0.0, 5000.0, 0.0, 5000.0]}, index=n.snapshots
+        )
+        n.c.loads.dynamic.p_set.loc[:, "l"] = [0.0, 80.0, 0.0, 60.0]
+        return n
+
+    a, b = solved(build(), "linopy"), solved(build(), "nimopt")
+    assert b.objective == pytest.approx(a.objective, rel=1e-6)
+    status = b.c.generators.dynamic.status["cheap"].to_numpy()
+    assert np.allclose(status, a.c.generators.dynamic.status["cheap"].to_numpy())
+
+
+def test_the_cycle_basis_method_is_passed_to_pypsa(ac_dc_network):
+    with pytest.raises(ValueError, match="cycle_basis_method"):
+        ac_dc_network.optimize.create_model(
+            backend="nimopt", cycle_basis_method="unknown"
+        )
+
+
 # --- what the backend does not state, it refuses ----------------------------
 
 
 def test_a_quadratic_marginal_cost_is_refused():
     n = tiny(marginal_cost_quadratic=1.0)
     with pytest.raises(NotImplementedError, match="quadratic"):
+        n.optimize.create_model(backend="nimopt")
+
+
+@pytest.mark.parametrize("component", ["Line", "Transformer"])
+def test_a_voltage_angle_limit_is_refused(component):
+    n = tiny()
+    n.add("Bus", "c")
+    n.add(component, "x", bus0="b", bus1="c", x=0.1, s_nom=100, v_ang_max=10.0)
+    with pytest.raises(NotImplementedError, match=f"{component} v_ang_max"):
         n.optimize.create_model(backend="nimopt")
 
 
@@ -1993,21 +2041,20 @@ def test_the_conditional_value_is_no_less_than_the_expected_cost(extendable_stoc
     assert cvar >= operating - 1e-6
 
 
-def test_a_risk_averse_commitment_is_stated_where_linopy_raises(committable_stochastic):
-    # linopy addresses the status variable without its scenario dimension, so
-    # it states no model here; the backend does, and the tail prices out
-    n = committable_stochastic
-    n.set_risk_preference(alpha=0.5, omega=1.0)
-    with pytest.raises(KeyError, match="scenario"):
-        n.optimize.create_model()
+def test_a_risk_averse_commitment_reaches_the_optimum_linopy_reaches(
+    committable_stochastic,
+):
+    def averse():
+        n = committable_stochastic.copy()
+        n.set_risk_preference(alpha=0.5, omega=1.0)
+        return n
 
-    averse = committable_stochastic
-    averse.set_risk_preference(alpha=0.5, omega=1.0)
-    averse.optimize(backend="nimopt", solver_name=SOLVER)
-    tail = float(averse.model.variables["CVaR"].solution)
+    a, b = solved(averse(), "linopy"), solved(averse(), "nimopt")
+    assert b.objective == pytest.approx(a.objective, rel=1e-9)
+    tail = float(b.model.variables["CVaR"].solution)
     # a tail mass of 1 - alpha = 0.5 sits inside the high scenario, whose
     # probability is 0.6, so the tail average is that scenario's own cost
-    assert averse.objective == pytest.approx(tail, rel=1e-9)
+    assert b.objective == pytest.approx(tail, rel=1e-9)
 
     neutral = committable_stochastic.copy()
     neutral.optimize(backend="nimopt", solver_name=SOLVER)

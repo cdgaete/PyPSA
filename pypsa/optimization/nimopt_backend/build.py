@@ -87,6 +87,13 @@ GLOBAL_TYPES = (
 # global constraint types PyPSA states and the nimopt backend does not
 UNSTATED_GLOBAL_TYPES = ()
 
+# attributes PyPSA states and the nimopt backend does not, each with the default
+# at which PyPSA's formulation and the backend's agree
+UNSTATED_ATTRIBUTES = (
+    ("Line", "v_ang_max", np.inf),
+    ("Transformer", "v_ang_max", np.inf),
+)
+
 # families the backend does not yet state under a scenario dimension
 SCENARIO_UNSTATED = ()
 
@@ -138,6 +145,9 @@ def _refuse_unsupported(
                     reasons.append(f"{c.name} {col}")
                 if col in c.dynamic and not c.dynamic[col].empty:
                     reasons.append(f"{c.name} time-varying {col}")
+    for c_name, attr, default in UNSTATED_ATTRIBUTES:
+        if _departs(n.c[c_name], attr, default):
+            reasons.append(f"{c_name} {attr} other than {default}")
     glcs = n.c.global_constraints.static
     if not glcs.empty:
         other = sorted(set(glcs["type"]) & set(UNSTATED_GLOBAL_TYPES))
@@ -158,6 +168,15 @@ def _refuse_unsupported(
     if reasons:
         msg = "The nimopt backend does not state: " + "; ".join(reasons) + "."
         raise NotImplementedError(msg)
+
+
+def _departs(c: Any, attr: str, default: float) -> bool:
+    """Return whether any component sets `attr` to a value other than `default`."""
+    if attr in c.static and (c.static[attr] != default).any():
+        return True
+    if attr not in c.dynamic or c.dynamic[attr].empty:
+        return False
+    return bool((c.dynamic[attr] != default).to_numpy().any())
 
 
 # --- reading the network ---------------------------------------------------
@@ -1286,10 +1305,10 @@ def _tighten_relaxation(
     exact.
     """
     fixed = np.isin(_names(com), _names(com.difference(c.extendables)))
-    equal = fixed & (
-        _per_component(c, "start_up_cost", com, np.float64)
-        == _per_component(c, "shut_down_cost", com, np.float64)
+    same = sc.grid(c, "start_up_cost", sns, com) == sc.grid(
+        c, "shut_down_cost", sns, com
     )
+    equal = fixed & same.all([d for d in same.dims if d != "name"]).to_numpy()
     if not equal.any() or len(sns) < 2:
         return
     N, T = sets
@@ -1965,11 +1984,17 @@ def _require_invariant_impedance(n: Network, weighted: Any, sc: Scenarios) -> No
 
 
 def define_kirchhoff_voltage_constraints(
-    n: Network, m: NimoptModel, sns: pd.Index, sc: Scenarios, pe: Periods
+    n: Network,
+    m: NimoptModel,
+    sns: pd.Index,
+    sc: Scenarios,
+    pe: Periods,
+    *,
+    cycle_basis_method: str = "bfs-refined",
 ) -> None:
     """Kirchhoff's voltage law on every cycle of every sub-network."""
     n.calculate_dependent_values()
-    weighted = n.cycle_matrix(apply_weights=True)
+    weighted = n.cycle_matrix(apply_weights=True, cycle_basis_method=cycle_basis_method)
     if weighted.empty:
         return
     _require_invariant_impedance(n, weighted, sc)
@@ -1998,7 +2023,9 @@ def define_kirchhoff_voltage_constraints(
 
     rhs: Any = 0.0
     if "Transformer" in weighted.index.unique("type"):
-        plain = n.cycle_matrix(apply_weights=False).loc["Transformer"]
+        plain = n.cycle_matrix(
+            apply_weights=False, cycle_basis_method=cycle_basis_method
+        ).loc["Transformer"]
         tr = n.c.transformers
         names = plain.index.intersection(tr.active_assets)
         _, shifting = _shifting(n)
@@ -3228,9 +3255,7 @@ def define_objective(
     term scenario by scenario. A term stated per period is weighted once by
     the period's objective weighting: an operating term through the snapshot
     it stands at, a capacity through every period the asset is active in.
-
-    PyPSA states no constant for investment already done where the horizon
-    carries periods, so this states none either.
+    The constant for capacity already built is weighted the same way.
     """
     T = m.sets["snapshot"]
     weight = _weights(n, sns, "objective") * pe.weighting(n, "objective")
@@ -3280,8 +3305,7 @@ def define_objective(
             continue
         cost = sc.over(held * _active_periods(n, c, sns, ext, sc=sc, pe=pe), ("name",))
         cost = cost * sc.probability
-        if not pe:
-            constant += float((cost * sc.static(c, attr, ext)).sum())
+        constant += float((cost * sc.static(c, attr, ext)).sum())
         live = (cost.to_numpy() != 0) & ~np.isin(_names(ext), _names(curved))
         if live.any():
             N = m.sets[c_name]
@@ -3366,8 +3390,8 @@ def define_objective(
         N = m.sets[c_name]
         ones = sc.ones(_names(com), sns)
         for kind, cost in (
-            ("start_up", sc.static(c, "start_up_cost", com)),
-            ("shut_down", sc.static(c, "shut_down_cost", com)),
+            ("start_up", sc.grid(c, "start_up_cost", sns, com)),
+            ("shut_down", sc.grid(c, "shut_down_cost", sns, com)),
             ("status", sc.grid(c, "stand_by_cost", sns, com) * weight),
         ):
             grid = sc.over(cost * ones, ("name", "snapshot"))
@@ -3431,6 +3455,7 @@ def create_model(
     include_objective_constant: bool = True,
     meshed_thresholds: Any = None,
     piecewise_options: Any = None,
+    cycle_basis_method: str = "bfs-refined",
     **kwargs: Any,
 ) -> NimoptModel:
     """Build the network's optimisation problem as a nimopt model, stored at `n.model`."""
@@ -3479,7 +3504,9 @@ def create_model(
     )
     if segments:
         define_loss_constraints(n, m, sns, segments, sc=sc, pe=pe)
-    define_kirchhoff_voltage_constraints(n, m, sns, sc, pe)
+    define_kirchhoff_voltage_constraints(
+        n, m, sns, sc, pe, cycle_basis_method=cycle_basis_method
+    )
     define_storage_unit_constraints(n, m, sns, sc, pe)
     define_store_constraints(n, m, sns, sc, pe)
     define_total_supply_constraints(n, m, sns, sc=sc, pe=pe)
