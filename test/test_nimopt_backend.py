@@ -3199,3 +3199,28 @@ def test_the_backend_reads_nimopt_through_its_public_names():
             ):
                 offenders.append(f"{name}: no.{node.attr}")
     assert offenders == [], offenders
+
+
+# --- singleton rows ---------------------------------------------------------
+
+
+def test_singleton_rows_gives_the_same_objective_and_bound_duals(ac_dc_network):
+    rows, bounds = ac_dc_network.copy(), ac_dc_network.copy()
+    rows.optimize(backend="nimopt", singleton_rows="rows", assign_all_duals=True)
+    bounds.optimize(backend="nimopt", assign_all_duals=True)
+    assert bounds.objective == pytest.approx(rows.objective, rel=1e-9)
+    # a network whose generator bounds never bind compares no dual at all
+    bound_duals = [
+        np.abs(rows.c.generators.dynamic[attribute].to_numpy())
+        for attribute in ("mu_lower", "mu_upper")
+    ]
+    assert np.maximum(*bound_duals).max() > 1e-6
+    for attribute in ("mu_lower", "mu_upper"):
+        left = bounds.c.generators.dynamic[attribute].to_numpy()
+        right = rows.c.generators.dynamic[attribute].to_numpy()
+        np.testing.assert_allclose(left, right, rtol=1e-6, atol=1e-6)
+
+
+def test_an_unknown_singleton_rows_value_is_refused(ac_dc_network):
+    with pytest.raises(ValueError, match="singleton_rows"):
+        ac_dc_network.optimize(backend="nimopt", singleton_rows="columns")

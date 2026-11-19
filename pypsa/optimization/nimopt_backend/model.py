@@ -404,8 +404,11 @@ class NimoptModel:
         self, solver_name: str = "highs", progress: bool = False, **kwargs: Any
     ) -> tuple[str, str]:
         """Solve through nimopt, answering linopy's `(status, condition)` pair."""
+        singleton_rows = kwargs.pop("singleton_rows", "bounds")
         options = _translate_options(solver_name, kwargs)
         self.solver_name = solver_name
-        self.solution = self.model.solve(solver_name, options or None, progress)
+        self.solution = self.model.solve(
+            solver_name, options or None, progress, singleton_rows
+        )
         self.status, self.termination_condition = STATUS[self.solution.status]
         return self.status, self.termination_condition
